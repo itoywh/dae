@@ -1,6 +1,6 @@
 /*
 *  SPDX-License-Identifier: AGPL-3.0-only
-*  Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+*  Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package cmd
@@ -936,9 +936,11 @@ func retireControlPlaneConnections(
 			log.Infoln("[Reload] Old control plane drained active sessions; retiring immediately")
 		case controlPlaneDrainCanceled:
 			log.Warnln("[Reload] New generation ready; accelerating old generation retirement")
+			_ = c.AbortConnections()
 		case controlPlaneDrainTimeout:
 			log.WithField("active_sessions", c.ActiveSessionCount()).
 				Warnln("[Reload] Old control plane drain timed out; forcing retirement")
+			_ = c.AbortConnections()
 		}
 	}
 }
@@ -1101,6 +1103,11 @@ func shutdownAfterSignalWithHandoff(
 			}
 		}
 	}
+	// After all control planes are closed, reset global UDP state to stop
+	// background janitors and release pooled sockets. This must only run during
+	// process shutdown; hot reload must never reset shared global pools.
+	control.ResetGlobalUdpState()
+
 	if len(closeErrs) > 0 {
 		return fmt.Errorf("close control plane: %w", errors.Join(closeErrs...))
 	}
