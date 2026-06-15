@@ -40,6 +40,14 @@ type DialerGroup struct {
 	resuscitateLastTime atomic.Int64
 	noAliveLogLastTimes [8]atomic.Int64
 
+	// fixed_fallback retry state
+	fixedFallbackDeadSince  atomic.Int64
+	fixedFallbackRetryCount atomic.Int64
+
+	// fixed_fallback log rate limit
+	fixedFallbackLastLogMark atomic.Int64
+	fixedFallbackLastLogTime atomic.Int64
+
 	cachedMinCheckInterval time.Duration
 }
 
@@ -307,6 +315,42 @@ func (g *DialerGroup) logNoAlive(
 	}).Warn("no alive dialer for selection (rate-limited)")
 }
 
+// logFixedFallback records state transitions for the fixed_fallback policy.
+// state=0 means the fixed dialer is alive (reset). state<0 means we fell back
+// to an alternative. Rate-limited to 10s.
+func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *dialer.NetworkType) {
+	if g.log == nil {
+		return
+	}
+	nodeName := ""
+	if fixed != nil && fixed.Property() != nil {
+		nodeName = fixed.Property().Name
+	}
+
+	switch {
+	case state == 0:
+		g.fixedFallbackDeadSince.Store(0)
+		g.fixedFallbackRetryCount.Store(0)
+		old := g.fixedFallbackLastLogMark.Swap(0)
+		if old != 0 && g.tryDoRateLimitedAction(&g.fixedFallbackLastLogTime, 10*time.Second) {
+			g.log.WithFields(logrus.Fields{
+				"group":   g.Name,
+				"dialer":  nodeName,
+				"network": nt.String(),
+			}).Infoln("Fixed dialer is ALIVE, traffic restored")
+		}
+	case state < 0:
+		old := g.fixedFallbackLastLogMark.Swap(-1)
+		if old >= 0 && g.tryDoRateLimitedAction(&g.fixedFallbackLastLogTime, 10*time.Second) {
+			g.log.WithFields(logrus.Fields{
+				"group":   g.Name,
+				"dialer":  nodeName,
+				"network": nt.String(),
+			}).Warnln("Fixed dialer DEAD, fallen back to alternative")
+		}
+	}
+}
+
 // Select is a backward-compatible wrapper for SelectWithExclusion.
 func (g *DialerGroup) Select(networkType *dialer.NetworkType, strictIpVersion bool) (d *dialer.Dialer, latency time.Duration, err error) {
 	d, latency, _, err = g.SelectWithExclusionResult(networkType, strictIpVersion, nil)
@@ -380,6 +424,50 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 		selected := preferAlternateSelectionNetworkType(g.Dialers[policy.FixedIndex], networkType)
 		return g.Dialers[policy.FixedIndex], 0, selected, nil
 
+	case consts.DialerSelectionPolicy_FixedWithFallback:
+		if policy.FixedIndex < 0 || policy.FixedIndex >= len(g.Dialers) {
+			return nil, 0, nil, fmt.Errorf("selected dialer index is out of range")
+		}
+		fixed := g.Dialers[policy.FixedIndex]
+		fallbackPolicy := DialerSelectionPolicy{Policy: policy.FallbackPolicy}
+		networkTypes, count := g.selectionNetworkTypes(networkType, fallbackPolicy)
+
+		for i := range count {
+			a := state.aliveDialerSets[networkTypes[i].Index()]
+			if a == nil {
+				continue
+			}
+			nt := &networkTypes[i]
+
+			// Try fixed dialer first
+			if fixed != nil && fixed.MustGetAlive(nt) {
+				g.logFixedFallback(0, fixed, nt)
+				selected := preferAlternateSelectionNetworkType(fixed, nt)
+				return fixed, 0, selected, nil
+			}
+
+			// Fixed dead: use fallback policy
+			g.logFixedFallback(-1, fixed, nt)
+
+			switch policy.FallbackPolicy {
+			case consts.DialerSelectionPolicy_Random:
+				d := a.GetRandExcluded(excluded)
+				if d != nil {
+					selected := preferAlternateSelectionNetworkType(d, nt)
+					return d, 0, selected, nil
+				}
+			case consts.DialerSelectionPolicy_MinLastLatency,
+				consts.DialerSelectionPolicy_MinAverage10Latencies,
+				consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+				d, lat := a.GetMinLatency(excluded)
+				if d != nil {
+					selected := preferAlternateSelectionNetworkType(d, nt)
+					return d, lat, selected, nil
+				}
+			}
+		}
+		return nil, time.Hour, nil, ErrNoAliveDialer
+
 	case consts.DialerSelectionPolicy_MinLastLatency,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
@@ -404,6 +492,7 @@ func (g *DialerGroup) selectionNetworkTypes(networkType *dialer.NetworkType, pol
 	count = 1
 
 	if policy.Policy == consts.DialerSelectionPolicy_Fixed ||
+		policy.Policy == consts.DialerSelectionPolicy_FixedWithFallback ||
 		networkType.L4Proto != consts.L4ProtoStr_UDP ||
 		networkType.EffectiveUdpHealthDomain() != dialer.UdpHealthDomainData {
 		return networkTypes, count
@@ -443,13 +532,21 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 		return state
 	}
 
+	// Determine the policy to use for AliveDialerSet creation.
+	// FixedWithFallback uses its FallbackPolicy so latency is tracked
+	// for min_moving_avg / min / random fallback selection.
+	aliveSetPolicy := policy.Policy
+	if policy.Policy == consts.DialerSelectionPolicy_FixedWithFallback {
+		aliveSetPolicy = policy.FallbackPolicy
+	}
+
 	specs := standardSelectionNetworkTypes()
 	keys := dialer.StandardHealthKeys()
 
 	for i, nt := range specs {
 		networkType := *nt
 		set := dialer.NewAliveDialerSet(
-			g.log, g.Name, &networkType, g.checkTolerance, policy.Policy,
+			g.log, g.Name, &networkType, g.checkTolerance, aliveSetPolicy,
 			g.Dialers, g.dialersAnnotations,
 			func(networkType *dialer.NetworkType) func(alive bool) {
 				return func(alive bool) { g.aliveChangeCallback(alive, networkType, false) }
@@ -494,7 +591,8 @@ func policyNeedsAliveState(policy consts.DialerSelectionPolicy) bool {
 	case consts.DialerSelectionPolicy_Random,
 		consts.DialerSelectionPolicy_MinLastLatency,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
-		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		consts.DialerSelectionPolicy_FixedWithFallback:
 		return true
 	case consts.DialerSelectionPolicy_Fixed:
 		return false

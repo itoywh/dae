@@ -464,7 +464,47 @@ func getActiveDialerCount() int {
 	return poolActiveCount
 }
 
+// shouldSkipTcp6Probes returns true when tcp_check_url explicitly lists only IPv4
+// addresses (no explicit IPv6 entries).
+func shouldSkipTcp6Probes(raw []string) bool {
+	return shouldSkipIp6Probes(raw)
+}
+
+// shouldSkipUdp6Probes returns true when udp_check_dns explicitly lists only IPv4
+// addresses (no explicit IPv6 entries).
+func shouldSkipUdp6Probes(raw []string) bool {
+	return shouldSkipIp6Probes(raw)
+}
+
+func shouldSkipIp6Probes(raw []string) bool {
+	hasIpv6 := false
+	hasExplicitIpv4 := false
+	for i := 1; i < len(raw); i++ {
+		addr, err := netip.ParseAddr(raw[i])
+		if err != nil {
+			continue
+		}
+		if addr.Is6() {
+			hasIpv6 = true
+		} else {
+			hasExplicitIpv4 = true
+		}
+	}
+	if hasIpv6 {
+		return false
+	}
+	return hasExplicitIpv4
+}
+
 func (d *Dialer) aliveBackground() {
+	// If check_interval is 0 or not configured, skip connectivity check entirely
+	if d.CheckInterval == 0 {
+		if d.Log != nil {
+			d.Log.WithField("dialer", d.Property().Name).
+				Debugln("Connectivity check disabled (check_interval=0)")
+		}
+		return
+	}
 	cycle := d.CheckInterval
 	var tcpSomark uint32
 	var mptcp bool
@@ -563,7 +603,43 @@ func (d *Dialer) aliveBackground() {
 		},
 		CheckFunc: makeDnsCheckFunc(func(o *CheckDnsOption) netip.Addr { return o.Ip6 }, &udpNetwork),
 	}
-	var CheckOpts = []*CheckOption{tcp4CheckOpt, tcp6CheckOpt, udp4CheckDnsOpt, udp6CheckDnsOpt}
+	var CheckOpts []*CheckOption
+	useTcpCheck := len(d.TcpCheckOptionRaw.Raw) > 0
+	useUdpDns := len(d.CheckDnsOptionRaw.Raw) > 0
+	skipTcp6 := useTcpCheck && shouldSkipTcp6Probes(d.TcpCheckOptionRaw.Raw)
+	skipUdp6 := useUdpDns && shouldSkipUdp6Probes(d.CheckDnsOptionRaw.Raw)
+
+	if useTcpCheck {
+		CheckOpts = append(CheckOpts, tcp4CheckOpt)
+		if !skipTcp6 {
+			CheckOpts = append(CheckOpts, tcp6CheckOpt)
+		}
+	}
+	if useUdpDns {
+		CheckOpts = append(CheckOpts, udp4CheckDnsOpt)
+		if !skipUdp6 {
+			CheckOpts = append(CheckOpts, udp6CheckDnsOpt)
+		}
+	}
+
+	// If neither TCP nor UDP checks are configured, return early
+	if len(CheckOpts) == 0 {
+		if d.Log != nil {
+			d.Log.WithField("dialer", d.Property().Name).
+				Debugln("No connectivity checks configured, skipping")
+		}
+		return
+	}
+
+	if d.Log != nil && d.Log.IsLevelEnabled(logrus.DebugLevel) {
+		d.Log.WithFields(logrus.Fields{
+			"dialer":   d.property.Name,
+			"tcp4":     useTcpCheck,
+			"tcp6":     useTcpCheck && !skipTcp6,
+			"udp4_dns": useUdpDns,
+			"udp6_dns": useUdpDns && !skipUdp6,
+		}).Debugln("Connectivity check probes configured")
+	}
 
 	var unusedOnce bool
 	checkUnused := func() bool {
@@ -683,7 +759,9 @@ func (d *Dialer) aliveBackground() {
 			// WITHOUT any successes in this cycle. This allows partially-working dual-stack
 			// nodes (e.g. V4 OK, V6 broken) to eventually wash white their penalty.
 			d.NotifyPeriodicCheckResult(consts.L4ProtoStr_TCP, cycleRes.tcpSuccess, cycleRes.tcpFailure && !cycleRes.tcpSuccess)
-			d.NotifyPeriodicCheckResultForType(udp4CheckDnsOpt.networkType, cycleRes.udpSuccess, cycleRes.udpFailure && !cycleRes.udpSuccess)
+			if useUdpDns {
+				d.NotifyPeriodicCheckResultForType(udp4CheckDnsOpt.networkType, cycleRes.udpSuccess, cycleRes.udpFailure && !cycleRes.udpSuccess)
+			}
 		}
 
 		// Targeted checks don't disturb the periodic timer — only full checks do.
@@ -971,6 +1049,17 @@ func (d *Dialer) markUnavailableInternal(typ *NetworkType, force bool, isTraffic
 
 	if wasAlive != alive {
 		d.notifyAliveTransition(typ, alive)
+		// Log alive→dead transitions for operational visibility.
+		if !alive && d.Log != nil {
+			nodeName := ""
+			if d.property != nil {
+				nodeName = d.property.Name
+			}
+			d.Log.WithFields(logrus.Fields{
+				"dialer":  nodeName,
+				"network": typ.String(),
+			}).Warnln("Node became DEAD")
+		}
 	}
 
 	// Notify sticky IP dialer and recovery detection ONLY when truly transitioning to dead.
@@ -1011,6 +1100,18 @@ func (d *Dialer) markAvailable(typ *NetworkType, latency time.Duration) (collect
 	d.NotifyHealthCheckResult(typ, true, isRevival)
 	if isRevival {
 		d.notifyAliveTransition(typ, true)
+		// Log dead→alive transitions for operational visibility.
+		if d.Log != nil {
+			nodeName := ""
+			if d.property != nil {
+				nodeName = d.property.Name
+			}
+			d.Log.WithFields(logrus.Fields{
+				"dialer":  nodeName,
+				"network": typ.String(),
+				"latency": latency.String(),
+			}).Infoln("Node became ALIVE")
+		}
 	}
 
 	return update, avg
