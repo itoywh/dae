@@ -465,6 +465,13 @@ func getActiveDialerCount() int {
 }
 
 func (d *Dialer) aliveBackground() {
+	// If check_interval is 0 or not configured, skip connectivity check entirely
+	if d.CheckInterval == 0 {
+		d.Log.WithField("dialer", d.Property().Name).
+			Debugln("Connectivity check disabled (check_interval=0)")
+		return
+	}
+
 	cycle := d.CheckInterval
 	var tcpSomark uint32
 	var mptcp bool
@@ -563,7 +570,28 @@ func (d *Dialer) aliveBackground() {
 		},
 		CheckFunc: makeDnsCheckFunc(func(o *CheckDnsOption) netip.Addr { return o.Ip6 }, &udpNetwork),
 	}
-	var CheckOpts = []*CheckOption{tcp4CheckOpt, tcp6CheckOpt, udp4CheckDnsOpt, udp6CheckDnsOpt}
+	// Build CheckOpts dynamically based on configuration:
+	//   - Only add TCP checks if tcp_check_url is configured
+	//   - Only add UDP DNS checks if udp_check_dns is configured
+	useTcpCheck := len(d.TcpCheckOptionRaw.Raw) > 0
+	useUdpDns := len(d.CheckDnsOptionRaw.Raw) > 0
+
+	var CheckOpts []*CheckOption
+	if useTcpCheck {
+		CheckOpts = append(CheckOpts, tcp4CheckOpt)
+		CheckOpts = append(CheckOpts, tcp6CheckOpt)
+	}
+	if useUdpDns {
+		CheckOpts = append(CheckOpts, udp4CheckDnsOpt)
+		CheckOpts = append(CheckOpts, udp6CheckDnsOpt)
+	}
+
+	// If neither TCP nor UDP checks are configured, return early
+	if len(CheckOpts) == 0 {
+		d.Log.WithField("dialer", d.Property().Name).
+			Debugln("No connectivity checks configured, skipping")
+		return
+	}
 
 	var unusedOnce bool
 	checkUnused := func() bool {
