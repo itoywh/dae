@@ -16,6 +16,7 @@ on:
     branches:
       - main
       - kdae
+      - v2.0-custom
     paths:
       - "**/*.go"
       - "**/*.c"
