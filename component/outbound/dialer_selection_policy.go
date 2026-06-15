@@ -70,7 +70,7 @@ func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *Dialer
 		if f.Params[0].Key != "" {
 			return nil, fmt.Errorf(`invalid "%v" param format: first param must be index (no key)`, f.Name)
 		}
-		index, err = strconv.Atoi(f.Params[0].Val)
+		index, err := strconv.Atoi(f.Params[0].Val)
 		if err != nil {
 			return nil, fmt.Errorf(`invalid "%v" param format: %w`, f.Name, err)
 		}
