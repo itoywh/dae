@@ -26,6 +26,7 @@ on:
       - ".github/workflows/build.yml"
       - ".github/workflows/seed-build.yml"
       - "Makefile"
+  workflow_dispatch:
 
 jobs:
   pre-actions:
