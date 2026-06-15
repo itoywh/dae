@@ -18,9 +18,9 @@ import (
 type DialerSelectionPolicy struct {
 	Policy               consts.DialerSelectionPolicy
 	FixedIndex           int
-	FixedFallbackTimeout time.Duration                // 节点超时时间
-	FixedFallbackRetries int                          // 超时重试次数
-	FallbackPolicy       consts.DialerSelectionPolicy // 重试耗尽后的回退策略，默认 min_moving_avg
+	FixedFallbackTimeout time.Duration
+	FixedFallbackRetries int
+	FallbackPolicy       consts.DialerSelectionPolicy // default min_moving_avg
 }
 
 func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *DialerSelectionPolicy, err error) {
@@ -70,7 +70,7 @@ func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *Dialer
 		if f.Params[0].Key != "" {
 			return nil, fmt.Errorf(`invalid "%v" param format: first param must be index (no key)`, f.Name)
 		}
-		index, err := strconv.Atoi(f.Params[0].Val)
+		index, err = strconv.Atoi(f.Params[0].Val)
 		if err != nil {
 			return nil, fmt.Errorf(`invalid "%v" param format: %w`, f.Name, err)
 		}
@@ -95,8 +95,8 @@ func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *Dialer
 			if err != nil {
 				return nil, fmt.Errorf(`invalid "%v" param format: retries must be an integer: %w`, f.Name, err)
 			}
-			if retries < 0 {
-				return nil, fmt.Errorf(`invalid "%v" param format: retries must be >= 0`, f.Name)
+			if retries < 1 {
+				return nil, fmt.Errorf(`invalid "%v" param format: retries must be >= 1`, f.Name)
 			}
 		}
 		// Parse fallback policy (optional, fourth param)
@@ -143,6 +143,7 @@ func parsePolicyName(s string) (consts.DialerSelectionPolicy, error) {
 	}
 }
 
+// parseDurationWithUnit parses a duration string with unit suffix.
 // Supported: "ms" (milliseconds), "s" (seconds), "m" (minutes).
 // No suffix defaults to seconds for backward compatibility.
 func parseDurationWithUnit(s string) (time.Duration, error) {

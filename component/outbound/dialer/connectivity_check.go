@@ -124,9 +124,6 @@ type collection struct {
 	MovingAverage     time.Duration
 	LastProbe         DialerProbeObservationSnapshot
 	Alive             atomic.Bool
-	// DeadSince records when this collection transitioned to dead (unix nano).
-	// Zero value means alive or never set. Written under collectionFineMu.
-	DeadSince int64
 }
 
 func newCollection() *collection {
@@ -139,39 +136,11 @@ func newCollection() *collection {
 }
 
 func (d *Dialer) mustGetCollection(typ *NetworkType) *collection {
-	idx := typ.Index()
-	// When udp_check_dns is not configured, DNS-UDP collections (IdxDnsUdp4/6)
-	// are never probed and their Alive flag stays true forever (initial value).
-	// This false-positive "alive" breaks the fixed_fallback retry state machine
-	// because DNS UDP always resets the retry timer before TCP can advance it.
-	// Solution: redirect DNS-UDP lookups to the corresponding TCP collection
-	// (same IP version) so they share the same (correct) Alive value.
-	if len(d.CheckDnsOptionRaw.Raw) == 0 {
-		switch idx {
-		case IdxDnsUdp4:
-			idx = IdxTcp4
-		case IdxDnsUdp6:
-			idx = IdxTcp6
-		}
-	}
-	return d.collections[idx]
+	return d.collections[typ.Index()]
 }
 
 func (d *Dialer) MustGetAlive(typ *NetworkType) bool {
 	return d.mustGetCollection(typ).Alive.Load()
-}
-
-// GetDeadSince returns the unix nano timestamp when this collection transitioned
-// to dead, or 0 if the collection is alive or was never set dead.
-// This is used by fixed_fallback to compute how long the node has been dead
-// independently of when traffic starts flowing.
-func (d *Dialer) GetDeadSince(typ *NetworkType) int64 {
-	if d == nil || typ == nil {
-		return 0
-	}
-	d.collectionFineMu.RLock()
-	defer d.collectionFineMu.RUnlock()
-	return d.collections[typ.Index()].DeadSince
 }
 
 func (d *Dialer) SnapshotLastProbe(typ *NetworkType) DialerProbeObservationSnapshot {
@@ -495,13 +464,19 @@ func getActiveDialerCount() int {
 	return poolActiveCount
 }
 
-// shouldSkipIpFamily6 returns true when raw explicitly lists only IPv4 addresses
-// (no explicit IPv6 entries). This avoids unnecessary IPv6 probes when the user's
-// network doesn't support IPv6.
-// Returns false (keep IPv6 probes) when:
-//   - Explicit IPv6 addresses are found in config
-//   - No explicit IPs are given (DNS resolution might return IPv6)
-func shouldSkipIpFamily6(raw []string) bool {
+// shouldSkipTcp6Probes returns true when tcp_check_url explicitly lists only IPv4
+// addresses (no explicit IPv6 entries).
+func shouldSkipTcp6Probes(raw []string) bool {
+	return shouldSkipIp6Probes(raw)
+}
+
+// shouldSkipUdp6Probes returns true when udp_check_dns explicitly lists only IPv4
+// addresses (no explicit IPv6 entries).
+func shouldSkipUdp6Probes(raw []string) bool {
+	return shouldSkipIp6Probes(raw)
+}
+
+func shouldSkipIp6Probes(raw []string) bool {
 	hasIpv6 := false
 	hasExplicitIpv4 := false
 	for i := 1; i < len(raw); i++ {
@@ -515,8 +490,10 @@ func shouldSkipIpFamily6(raw []string) bool {
 			hasExplicitIpv4 = true
 		}
 	}
-
-	return hasExplicitIpv4 && !hasIpv6
+	if hasIpv6 {
+		return false
+	}
+	return hasExplicitIpv4
 }
 
 func (d *Dialer) aliveBackground() {
@@ -524,9 +501,7 @@ func (d *Dialer) aliveBackground() {
 	if d.CheckInterval == 0 {
 		if d.Log != nil {
 			d.Log.WithField("dialer", d.Property().Name).
-				Warnln("Connectivity check disabled: check_interval not configured. " +
-					"Nodes will not be health-checked. " +
-					"Add check_interval, tcp_check_url, and udp_check_dns to enable.")
+				Debugln("Connectivity check disabled (check_interval=0)")
 		}
 		return
 	}
@@ -631,8 +606,8 @@ func (d *Dialer) aliveBackground() {
 	var CheckOpts []*CheckOption
 	useTcpCheck := len(d.TcpCheckOptionRaw.Raw) > 0
 	useUdpDns := len(d.CheckDnsOptionRaw.Raw) > 0
-	skipTcp6 := useTcpCheck && shouldSkipIpFamily6(d.TcpCheckOptionRaw.Raw)
-	skipUdp6 := useUdpDns && shouldSkipIpFamily6(d.CheckDnsOptionRaw.Raw)
+	skipTcp6 := useTcpCheck && shouldSkipTcp6Probes(d.TcpCheckOptionRaw.Raw)
+	skipUdp6 := useUdpDns && shouldSkipUdp6Probes(d.CheckDnsOptionRaw.Raw)
 
 	if useTcpCheck {
 		CheckOpts = append(CheckOpts, tcp4CheckOpt)
@@ -651,8 +626,7 @@ func (d *Dialer) aliveBackground() {
 	if len(CheckOpts) == 0 {
 		if d.Log != nil {
 			d.Log.WithField("dialer", d.Property().Name).
-				Warnln("Connectivity check disabled: neither tcp_check_url nor udp_check_dns configured. " +
-					"Nodes will not be health-checked.")
+				Debugln("No connectivity checks configured, skipping")
 		}
 		return
 	}
@@ -784,9 +758,7 @@ func (d *Dialer) aliveBackground() {
 			// Stability-based wash white: only reset stability if a protocol family had failures
 			// WITHOUT any successes in this cycle. This allows partially-working dual-stack
 			// nodes (e.g. V4 OK, V6 broken) to eventually wash white their penalty.
-			if useTcpCheck {
-				d.NotifyPeriodicCheckResult(consts.L4ProtoStr_TCP, cycleRes.tcpSuccess, cycleRes.tcpFailure && !cycleRes.tcpSuccess)
-			}
+			d.NotifyPeriodicCheckResult(consts.L4ProtoStr_TCP, cycleRes.tcpSuccess, cycleRes.tcpFailure && !cycleRes.tcpSuccess)
 			if useUdpDns {
 				d.NotifyPeriodicCheckResultForType(udp4CheckDnsOpt.networkType, cycleRes.udpSuccess, cycleRes.udpFailure && !cycleRes.udpSuccess)
 			}
@@ -1064,13 +1036,6 @@ func (d *Dialer) markUnavailableInternal(typ *NetworkType, force bool, isTraffic
 	}
 	wasAlive := collection.Alive.Load()
 	collection.Alive.Store(alive)
-	if wasAlive != alive {
-		if alive {
-			collection.DeadSince = 0
-		} else {
-			collection.DeadSince = time.Now().UnixNano()
-		}
-	}
 
 	update := collectionUpdate{
 		alive:             alive,
@@ -1117,10 +1082,6 @@ func (d *Dialer) markAvailable(typ *NetworkType, latency time.Duration) (collect
 	avg, _ := collection.Latencies10.AvgLatency()
 	collection.MovingAverage = (collection.MovingAverage + latency) / 2
 	wasAlive := collection.Alive.Swap(true)
-	// Clear DeadSince on revival.
-	if !wasAlive {
-		collection.DeadSince = 0
-	}
 	update := collectionUpdate{
 		alive:             true,
 		movingAverage:     collection.MovingAverage,
@@ -1172,17 +1133,6 @@ func (d *Dialer) markAvailableTraffic(typ *NetworkType) collectionUpdate {
 	d.NotifyHealthCheckResult(typ, true, isRevival)
 	if isRevival {
 		d.notifyAliveTransition(typ, true)
-		// Log dead→alive transitions for operational visibility.
-		if d.Log != nil {
-			nodeName := ""
-			if d.property != nil {
-				nodeName = d.property.Name
-			}
-			d.Log.WithFields(logrus.Fields{
-				"dialer":  nodeName,
-				"network": typ.String(),
-			}).Infoln("Node became ALIVE (traffic)")
-		}
 	}
 	return update
 }
