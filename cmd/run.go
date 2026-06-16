@@ -325,7 +325,8 @@ func (r *Runner) Run() (err error) {
 	// New ControlPlane.
 	ctx, cancel := context.WithCancel(context.Background())
 	currCancel = cancel
-	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs)
+	configureTransparentHugePages(log, conf.Global.DisableTHP)
+	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, false)
 	if err != nil {
 		cancel()
 		return err
@@ -473,11 +474,8 @@ func (r *Runner) Run() (err error) {
 			if stagedHotHandoff {
 				log.Warnln("[Reload] Prepare staged same-port handoff")
 				ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-				newC, prepareErr := newPreparedControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs)
+				newC, prepareErr := newPreparedControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs, dnsConfigEqual(conf, newConf))
 				dnsCache = nil
-				if prepareErr == nil {
-					newC.SetDNSRoutingUnchanged(dnsConfigEqual(conf, newConf))
-				}
 				if prepareErr != nil {
 					reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
 					reloadManager.setReloadError(reloadErr)
@@ -539,11 +537,8 @@ func (r *Runner) Run() (err error) {
 
 			log.Warnln("[Reload] Load new control plane")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-			newC, err := newControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs)
+			newC, err := newControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs, dnsConfigEqual(conf, newConf))
 			dnsCache = nil // Allow previous generation's clone to be GC'd.
-			if err == nil {
-				newC.SetDNSRoutingUnchanged(dnsConfigEqual(conf, newConf))
-			}
 
 			var newCancel context.CancelFunc
 			if err != nil {
@@ -559,7 +554,7 @@ func (r *Runner) Run() (err error) {
 					obj = nil
 				}
 				ctx, cancel = context.WithTimeout(context.Background(), reloadPrepareTimeout)
-				newC, err = newControlPlane(ctx, log, obj, rollbackDNSCache, conf, externGeoDataDirs)
+				newC, err = newControlPlane(ctx, log, obj, rollbackDNSCache, conf, externGeoDataDirs, false)
 				err = wrapReloadTimeoutError("rollback control plane", err, reloadPrepareTimeout)
 				if err != nil {
 					_ = sdnotify.Stopping()
@@ -1108,15 +1103,34 @@ func shutdownAfterSignalWithHandoff(
 	return nil
 }
 
-func newControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, false)
+func newControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, false, dnsRoutingUnchanged)
 }
 
-func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, true)
+func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, true, dnsRoutingUnchanged)
 }
 
-func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool) (c *control.ControlPlane, err error) {
+func configureTransparentHugePages(log *logrus.Logger, disable bool) {
+	value := uintptr(0)
+	action := "enable"
+	if disable {
+		value = 1
+		action = "disable"
+	}
+
+	if err := unix.Prctl(unix.PR_SET_THP_DISABLE, value, 0, 0, 0); err != nil {
+		if log != nil {
+			log.WithError(err).Warnf("Failed to %s transparent huge pages for dae process", action)
+		}
+		return
+	}
+	if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
+		log.Debugf("Configured transparent huge pages for dae process: disable=%v", disable)
+	}
+}
+
+func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
 	if conf.Global.SoMarkFromDae == 0 {
@@ -1315,6 +1329,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			&conf.Global,
 			&conf.Dns,
 			externGeoDataDirs,
+			dnsRoutingUnchanged,
 		)
 	} else {
 		c, err = control.NewControlPlaneWithContext(
@@ -1328,6 +1343,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			&conf.Global,
 			&conf.Dns,
 			externGeoDataDirs,
+			dnsRoutingUnchanged,
 		)
 	}
 	if err != nil {
