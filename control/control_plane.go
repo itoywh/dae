@@ -827,7 +827,7 @@ func newControlPlaneWithContextOptions(
 			return nil, err
 		}
 		if plane.sharedBpfReload && !plane.dnsRoutingUnchanged {
-			if err = clearReloadDomainRoutingMap(core.bpf.Load()); err != nil {
+			if err = clearReloadDomainRoutingMap(core.bpf); err != nil {
 				return nil, fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
 			}
 		}
@@ -1460,7 +1460,7 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 		c.core.lpmTrieIndices = lpmIndices
 	}
 	if c.sharedBpfReload && !c.dnsRoutingUnchanged {
-		if err := clearReloadDomainRoutingMap(c.core.bpf.Load()); err != nil {
+		if err := clearReloadDomainRoutingMap(c.core.bpf); err != nil {
 			return fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
 		}
 	}
