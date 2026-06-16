@@ -499,6 +499,9 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 
 			if newRetries < policy.FixedFallbackRetries {
 				// Still have retries left → reset timer and keep using fixed node
+				// but first fire targeted probes to attempt resuscitation.
+				fixed.NotifyCheckTcp()
+				fixed.NotifyCheckDnsUdp()
 				g.fixedFallbackDeadSince.Store(nowUnix)
 				g.logFixedFallback(10+int64(newRetries), fixed, nt)
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
