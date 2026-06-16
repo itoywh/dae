@@ -460,10 +460,6 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			nowUnix := time.Now().Unix()
 			deadSince := g.fixedFallbackDeadSince.Load()
 
-			// Pre-declare variables so goto doFallback below can jump past them
-			var newRetries int
-			var elapsed time.Duration
-
 			if deadSince == 0 {
 				// First time detecting dead → record time
 				g.fixedFallbackDeadSince.Store(nowUnix)
@@ -480,30 +476,20 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				return fixed, 0, selected, nil
 			}
 
-			elapsed = time.Duration(nowUnix-deadSince) * time.Second
+			elapsed := time.Duration(nowUnix-deadSince) * time.Second
 			if elapsed < policy.FixedFallbackTimeout {
 				// Still within timeout window → keep using fixed node
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
 				return fixed, 0, selected, nil
 			}
 
-			// Timeout passed → attempt one retry.
-			// Fire emergency probes to actively check if the node has recovered,
-			// instead of waiting for user traffic to fail naturally.
-			newRetries = int(g.fixedFallbackRetryCount.Add(1))
-
-			// Fire on every timeout tick, including the last one before fallback,
-			// so the node gets a final resuscitation chance before we give up.
-			fixed.NotifyCheckTcp()
-			fixed.NotifyCheckDnsUdp()
-
+			// Timeout passed → attempt one retry (let the connection fail naturally,
+			// which triggers resuscitate probes). Then count the retry.
+			newRetries := int(g.fixedFallbackRetryCount.Add(1))
 			if newRetries < policy.FixedFallbackRetries {
 				// Still have retries left → reset timer and keep using fixed node
-				// but first fire targeted probes to attempt resuscitation.
-				fixed.NotifyCheckTcp()
-				fixed.NotifyCheckDnsUdp()
 				g.fixedFallbackDeadSince.Store(nowUnix)
-				g.logFixedFallback(10+int64(newRetries), fixed, nt)
+				g.logFixedFallback(10+newRetries, fixed, nt)
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
 				return fixed, 0, selected, nil
 			}
