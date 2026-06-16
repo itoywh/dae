@@ -14,7 +14,7 @@
 
 | 补丁 | 说明 |
 |------|------|
-| **P2** | FixedWithFallback 增强：修复延迟不跟踪 bug，新增 timeout+retry 重试，8 个单元测试 |
+| **P2** | FixedWithFallback 增强：修复延迟不跟踪 bug，新增 timeout+retry 重试（retries=0 立即 fallback），8 个单元测试 |
 | **P3** | 健康检查完全配置化：移除默认值，opt-in；修复注释字段仍触发检查的 bug |
 | **P4** | 节点状态日志：DEAD/ALIVE 变更输出 |
 | **P5** | 日志时区：CST (Asia/Shanghai)，时间戳 `2006-01-02 15:04:05` |
