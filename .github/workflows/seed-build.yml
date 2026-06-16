@@ -30,30 +30,11 @@ jobs:
     strategy:
       matrix:
         goos: [ linux ]
-        goarch: [ arm64, 386, riscv64, loong64, mips64, mips64le, mipsle, mips, ppc64, ppc64le, s390x ]
+        goarch: [ arm64 ]
         include:
-          # BEGIN Linux ARM 5 6 7
-          - goos: linux
-            goarch: arm
-            goarm: 7
-          - goos: linux
-            goarch: arm
-            goarm: 6
-          - goos: linux
-            goarch: arm
-            goarm: 5
-          # END Linux ARM 5 6 7
-          # BEGIN Linux AMD64 v1 v2 v3
           - goos: linux
             goarch: amd64
             goamd64: v1
-          - goos: linux
-            goarch: amd64
-            goamd64: v2
-          - goos: linux
-            goarch: amd64
-            goamd64: v3
-          # END Linux AMD64 v1 v2 v3
       fail-fast: false
 
     runs-on: ubuntu-22.04
