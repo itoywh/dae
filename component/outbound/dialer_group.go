@@ -478,8 +478,9 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			nowUnix := time.Now().Unix()
 			deadSince := g.fixedFallbackDeadSince.Load()
 
-			// Pre-declare newRetries so goto doFallback below can jump past it
+			// Pre-declare variables so goto doFallback below can jump past them
 			var newRetries int
+			var elapsed time.Duration
 
 			if deadSince == 0 {
 				// First time detecting dead → record time
@@ -497,7 +498,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				return fixed, 0, selected, nil
 			}
 
-			elapsed := time.Duration(nowUnix-deadSince) * time.Second
+			elapsed = time.Duration(nowUnix-deadSince) * time.Second
 			if elapsed < policy.FixedFallbackTimeout {
 				// Still within timeout window → keep using fixed node
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
