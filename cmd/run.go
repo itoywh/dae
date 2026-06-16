@@ -444,7 +444,8 @@ func (r *Runner) Run() (err error) {
 			logrus.SetOutput(oldLogOutput)
 
 			portChanged := conf.Global.TproxyPort != newConf.Global.TproxyPort
-			stagedHotHandoff := !portChanged && listener != nil
+			datapathChanged := bpfDatapathChanged(conf, newConf)
+			stagedHotHandoff := !portChanged && !datapathChanged && listener != nil
 
 			// New control plane.
 			obj := c.PeekBpf()
@@ -453,6 +454,10 @@ func (r *Runner) Run() (err error) {
 			}
 			if portChanged {
 				log.Warnf("[Reload] Tproxy port changed from %d to %d; will perform a full reload of eBPF programs", conf.Global.TproxyPort, newConf.Global.TproxyPort)
+				_ = obj.Close()
+				obj = nil
+			} else if datapathChanged {
+				log.Warnln("[Reload] BPF datapath config changed (routing/group/dns/iface); will perform a full reload of eBPF programs")
 				_ = obj.Close()
 				obj = nil
 			}
@@ -470,6 +475,9 @@ func (r *Runner) Run() (err error) {
 				ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 				newC, prepareErr := newPreparedControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs)
 				dnsCache = nil
+				if prepareErr == nil {
+					newC.SetDNSRoutingUnchanged(dnsConfigEqual(conf, newConf))
+				}
 				if prepareErr != nil {
 					reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
 					reloadManager.setReloadError(reloadErr)
@@ -533,6 +541,9 @@ func (r *Runner) Run() (err error) {
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 			newC, err := newControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs)
 			dnsCache = nil // Allow previous generation's clone to be GC'd.
+			if err == nil {
+				newC.SetDNSRoutingUnchanged(dnsConfigEqual(conf, newConf))
+			}
 
 			var newCancel context.CancelFunc
 			if err != nil {
@@ -543,8 +554,8 @@ func (r *Runner) Run() (err error) {
 				cancel()
 
 				// Load last config back.
-				if portChanged {
-					log.Warnln("[Reload] Port already changed; attempting rollback with fresh eBPF objects")
+				if portChanged || datapathChanged {
+					log.Warnln("[Reload] BPF objects already replaced; attempting rollback with fresh eBPF objects")
 					obj = nil
 				}
 				ctx, cancel = context.WithTimeout(context.Background(), reloadPrepareTimeout)
