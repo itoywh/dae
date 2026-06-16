@@ -377,10 +377,6 @@ func bpfDatapathChanged(oldConf, newConf *config.Config) bool {
 	if !reflect.DeepEqual(oldConf.Global.WanInterface, newConf.Global.WanInterface) {
 		return true
 	}
-	// Conn-state map size → requires map recreation.
-	if oldConf.Global.BpfConnStateMapSize != newConf.Global.BpfConnStateMapSize {
-		return true
-	}
 	// Socket mark → stored in BPF param map; changing it on a shared object
 	// would affect the old generation's packet marking.
 	if oldConf.Global.SoMarkFromDae != newConf.Global.SoMarkFromDae ||
