@@ -1,14 +1,31 @@
-# dae
+# dae (itoywh fork)
 
-<img src="https://github.com/daeuniverse/dae/blob/main/logo.png" border="0" width="25%">
+> Fork from [daeuniverse/dae](https://github.com/daeuniverse/dae) with custom patches for enhanced node management.
 
 <p align="left">
-    <img src="https://github.com/daeuniverse/dae/actions/workflows/build.yml/badge.svg" alt="Build"/>
-    <img src="https://custom-icon-badges.herokuapp.com/github/license/daeuniverse/dae?logo=law&color=orange" alt="License"/>
-    <img src="https://custom-icon-badges.herokuapp.com/github/v/release/daeuniverse/dae?logo=rocket" alt="version">
-    <img src="https://custom-icon-badges.herokuapp.com/github/issues-pr-closed/daeuniverse/dae?color=purple&logo=git-pull-request&logoColor=white"/>
-    <img src="https://custom-icon-badges.herokuapp.com/github/last-commit/daeuniverse/dae?logo=history&logoColor=white" alt="lastcommit"/>
+    <img src="https://github.com/itoywh/dae/actions/workflows/build.yml/badge.svg" alt="Build"/>
+    <img src="https://img.shields.io/github/v/release/itoywh/dae?include_prereleases" alt="Release"/>
+    <img src="https://img.shields.io/github/license/daeuniverse/dae?color=orange" alt="License"/>
 </p>
+
+## v2.0-custom
+
+基于 dae v2.0.0rc1 的自定义构建，包含以下增强补丁：
+
+| 补丁 | 说明 |
+|------|------|
+| **P2** | FixedWithFallback 增强：修复延迟不跟踪 bug，新增 timeout+retry 重试，8 个单元测试 |
+| **P3** | 健康检查完全配置化：移除默认值，opt-in；修复注释字段仍触发检查的 bug |
+| **P4** | 节点状态日志：DEAD/ALIVE 变更输出 |
+| **P5** | 日志时区：CST (Asia/Shanghai)，时间戳 `2006-01-02 15:04:05` |
+
+**分支**: `v2.0-custom` · **预编译二进制**: [Releases](https://github.com/itoywh/dae/releases) · **PR**: [#1](https://github.com/itoywh/dae/pull/1)
+
+> 所有补丁仅修改 dialer 层，未触及 eBPF/reload 核心。
+
+---
+
+## 关于 dae (upstream)
 
 **_dae_**, means goose, is a high-performance transparent proxy solution.
 
