@@ -325,6 +325,7 @@ func (r *Runner) Run() (err error) {
 	// New ControlPlane.
 	ctx, cancel := context.WithCancel(context.Background())
 	currCancel = cancel
+	configureTransparentHugePages(log, conf.Global.DisableTHP)
 	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, false)
 	if err != nil {
 		cancel()
@@ -509,6 +510,7 @@ func (r *Runner) Run() (err error) {
 				oldListener := listener
 
 				hasOverlap := newC.InheritDialerHealthFrom(oldC)
+				configureTransparentHugePages(log, newConf.Global.DisableTHP)
 				c = newC
 				currCancel = cancel
 				conf = newConf
@@ -620,6 +622,7 @@ func (r *Runner) Run() (err error) {
 			oldConf := conf
 
 			hasOverlap := newC.InheritDialerHealthFrom(oldC)
+			configureTransparentHugePages(log, newConf.Global.DisableTHP)
 			c = newC
 			currCancel = newCancel
 			conf = newConf
@@ -1398,4 +1401,23 @@ func emptyConfig() (conf *config.Config, err error) {
 
 func init() {
 	rootCmd.AddCommand(runCmd)
+}
+
+func configureTransparentHugePages(log *logrus.Logger, disable bool) {
+	value := uintptr(0)
+	action := "enable"
+	if disable {
+		value = 1
+		action = "disable"
+	}
+
+	if err := unix.Prctl(unix.PR_SET_THP_DISABLE, value, 0, 0, 0); err != nil {
+		if log != nil {
+			log.WithError(err).Warnf("Failed to %s transparent huge pages for dae process", action)
+		}
+		return
+	}
+	if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
+		log.Debugf("Configured transparent huge pages for dae process: disable=%v", disable)
+	}
 }

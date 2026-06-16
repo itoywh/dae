@@ -52,6 +52,7 @@ type Global struct {
 	BandwidthMaxTx         string        `mapstructure:"bandwidth_max_tx" default:"0"`
 	BandwidthMaxRx         string        `mapstructure:"bandwidth_max_rx" default:"0"`
 	UDPHopInterval         time.Duration `mapstructure:"udphop_interval" default:"30s"`
+	DisableTHP             bool          `mapstructure:"disable_thp" default:"true"`
 }
 
 type Utls struct {
