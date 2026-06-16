@@ -59,6 +59,7 @@ var GlobalDesc = Desc{
 	"utls_imitate":                 "The Client Hello ID for uTLS to imitate. This takes effect only if tls_implementation is utls. See more: https://github.com/daeuniverse/dae/blob/331fa23c16/component/outbound/transport/tls/utls.go#L17",
 	"mptcp":                        "Enable Multipath TCP.  If is true, dae will try to use MPTCP to connect all nodes, but it will only take effects when the node supports MPTCP. It can use for load balance and failover to multiple interfaces and IPs.",
 	"bootstrap_resolver":           "Explicit DNS resolver used only for bootstrap lookups that must happen before dae DNS routing is available, such as resolving named DNS upstream hosts and dial_mode real-domain probes. When unset, dae falls back to 119.29.29.29:53 and 223.5.5.5:53 in order. Setting bootstrap_resolver disables those defaults and uses only the configured resolver.",
+	"disable_thp":                  "Disable transparent huge pages for the dae process. This reduces RSS inflation for dae userspace memory without changing system-wide THP settings.",
 }
 
 var DnsDesc = Desc{
