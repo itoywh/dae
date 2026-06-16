@@ -6,6 +6,7 @@
 package outbound
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/daeuniverse/outbound/netproxy"
 )
 
 // mockDialer implements a simple mock dialer for testing FixedWithFallback.
@@ -20,6 +22,10 @@ type mockDialer struct {
 	index      int
 	alive      atomic.Bool
 	name       string
+}
+
+func (m *mockDialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {
+	return nil, errors.New("not implemented")
 }
 
 func (m *mockDialer) Property() *dialer.Property {
