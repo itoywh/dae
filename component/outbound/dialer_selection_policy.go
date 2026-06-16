@@ -95,8 +95,8 @@ func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *Dialer
 			if err != nil {
 				return nil, fmt.Errorf(`invalid "%v" param format: retries must be an integer: %w`, f.Name, err)
 			}
-			if retries < 1 {
-				return nil, fmt.Errorf(`invalid "%v" param format: retries must be >= 1`, f.Name)
+			if retries < 0 {
+				return nil, fmt.Errorf(`invalid "%v" param format: retries must be >= 0`, f.Name)
 			}
 		}
 		// Parse fallback policy (optional, fourth param)

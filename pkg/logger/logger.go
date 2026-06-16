@@ -16,6 +16,7 @@ import (
 func init() {
 	// Always use CST (UTC+8) for log timestamps.
 	// On minimal OpenWrt/ImmortalWrt without tzdata, fall back to fixed offset.
+	// Note: logrus-prefixed-formatter uses time.Now() internally, which respects time.Local.
 	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
 		time.Local = loc
 	} else {
@@ -34,7 +35,7 @@ func SetLogger(log *logrus.Logger, logLevel string, disableTimestamp bool, logFi
 		DisableTimestamp: disableTimestamp,
 		FullTimestamp:    true,
 		ForceFormatting:  true,
-		TimestampFormat:  "2006-01-02 15:04:05",
+		TimestampFormat:  "2006-01-02 15:04:05 CST",
 	})
 	if logFileOpt != nil {
 		log.SetOutput(logFileOpt)
