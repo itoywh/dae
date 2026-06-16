@@ -505,11 +505,15 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				return fixed, 0, selected, nil
 			}
 
-			// Timeout passed → attempt one retry (let the connection fail naturally,
-			// which triggers resuscitate probes). Then count the retry.
+			// Timeout passed → attempt one retry.
+			// Fire emergency probes to actively check if the node has recovered,
+			// instead of waiting for user traffic to fail naturally.
 			newRetries = int(g.fixedFallbackRetryCount.Add(1))
 			if newRetries < policy.FixedFallbackRetries {
 				// Still have retries left → reset timer and keep using fixed node
+				// but first fire targeted probes to attempt resuscitation.
+				fixed.NotifyCheckTcp()
+				fixed.NotifyCheckDnsUdp()
 				g.fixedFallbackDeadSince.Store(nowUnix)
 				g.logFixedFallback(10+int64(newRetries), fixed, nt)
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
