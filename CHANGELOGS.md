@@ -13,6 +13,43 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
 ## Releases
 
 <!-- BEGIN NEW TOC ENTRY -->
+- [v2.0-custom-v3 (2026-06-17)](#v20-custom-v3-2026-06-17)
+<!-- END NEW TOC ENTRY -->
+
+### v2.0-custom-v3 (2026-06-17)
+
+> Release date: 2026/06/17
+
+#### 新增功能
+
+- **P4 - 节点状态变更日志 (DEAD/ALIVE)**
+  - 节点变为 DEAD 时输出日志：`Node became DEAD`
+  - 节点变为 ALIVE 时输出日志：`Node became ALIVE`（健康检查探针发现）
+  - 节点变为 ALIVE 时输出日志：`Node became ALIVE (traffic)`（真实流量发现）
+  - 便于运维人员实时监控节点健康状态
+
+#### 优化改进
+
+- **健康检查可配置化增强**
+  - 当 `check_interval=0` 时输出 Warn 日志提醒用户
+  - 当未配置 `tcp_check_url` 和 `udp_check_dns` 时输出 Warn 日志
+  - 用户不配置则不检查，配置什么检查什么
+
+- **探针 2s cooldown 机制说明**
+  - 紧急探针（FixedWithFallback 触发）有 2s 最小间隔保护 worker pool
+  - 实际探针间隔为 max(2s, 配置值)
+
+#### Bug 修复
+
+- 修复秒级精度 bug：timeout 使用 `UnixNano()` 实现亚秒级精度
+- 修复竞态条件：FixedWithFallback 使用互斥锁保护状态读写
+
+#### 编译信息
+
+- Commit: `b619754`
+- 编译时间: 2026-06-17 15:12 UTC
+
+---
 
 - [v2.0.0rc1 (Pre-release)](#v200rc1-pre-release)
 - [v1.1.0 (Latest)](#v110-latest)
