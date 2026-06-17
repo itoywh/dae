@@ -628,7 +628,8 @@ func (d *Dialer) aliveBackground() {
 	if len(CheckOpts) == 0 {
 		if d.Log != nil {
 			d.Log.WithField("dialer", d.Property().Name).
-				Debugln("No connectivity checks configured, skipping")
+				Warnln("Connectivity check disabled: neither tcp_check_url nor udp_check_dns configured. " +
+					"Nodes will not be health-checked.")
 		}
 		return
 	}

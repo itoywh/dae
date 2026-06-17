@@ -42,8 +42,8 @@ type DialerGroup struct {
 
 	// fixed_fallback retry state (protected by fixedFallbackMu)
 	fixedFallbackMu         sync.Mutex
-	fixedFallbackDeadSince  int64 // nanoseconds since epoch
-	fixedFallbackRetryCount int
+	fixedFallbackDeadSince  int64
+	fixedFallbackRetryCount int64
 
 	// fixed_fallback log rate limit
 	fixedFallbackLastLogMark atomic.Int64
@@ -462,7 +462,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			}
 			nt := &networkTypes[i]
 
-			// Try fixed dialer first (without lock - just checking alive state)
+			// Try fixed dialer first
 			if fixed != nil && fixed.MustGetAlive(nt) {
 				// Node is alive → reset retry state and use it
 				g.fixedFallbackMu.Lock()
@@ -477,14 +477,26 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				return fixed, 0, selected, nil
 			}
 
-			// Fixed dialer is dead. Apply retry logic with mutex protection.
-			g.fixedFallbackMu.Lock()
-			nowNano := time.Now().UnixNano()
-			deadSinceNano := g.fixedFallbackDeadSince
-			retryCount := g.fixedFallbackRetryCount
+			// Fixed dialer is dead. Apply retry logic with nanosecond precision
+			// and mutex-protected state reads/writes to avoid race conditions.
+			// Pre-declare all variables for goto compatibility (Go forbids
+			// jumping over variable declarations).
+			var (
+				nowNano       int64
+				deadSinceNano int64
+				retryCount    int64
+				elapsed       time.Duration
+				newRetryCount int64
+				maxRetries    int64
+				shouldFallback bool
+			)
 
-			// Pre-declare variables for goto
-			var shouldFallback bool
+			maxRetries = int64(policy.FixedFallbackRetries)
+
+			g.fixedFallbackMu.Lock()
+			nowNano = time.Now().UnixNano()
+			deadSinceNano = g.fixedFallbackDeadSince
+			retryCount = g.fixedFallbackRetryCount
 
 			if deadSinceNano == 0 {
 				// First time detecting dead → record time
@@ -494,7 +506,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				g.logFixedFallback(1, fixed, nt) // mark=1: dead_detected
 
 				// If retries is 0, skip retry logic and immediately fallback
-				if policy.FixedFallbackRetries <= 0 {
+				if maxRetries <= 0 {
 					g.logFixedFallback(-1, fixed, nt) // mark=-1: fallen_back
 					goto doFallback
 				}
@@ -504,7 +516,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				return fixed, 0, selected, nil
 			}
 
-			elapsed := time.Duration(nowNano - deadSinceNano)
+			elapsed = time.Duration(nowNano - deadSinceNano)
 			if elapsed < policy.FixedFallbackTimeout {
 				// Still within timeout window → keep using fixed node
 				g.fixedFallbackMu.Unlock()
@@ -513,29 +525,29 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			}
 
 			// Timeout passed → increment retry count
-			newRetryCount := retryCount + 1
+			newRetryCount = retryCount + 1
 			g.fixedFallbackRetryCount = newRetryCount
-			shouldFallback = newRetryCount >= policy.FixedFallbackRetries
+			shouldFallback = newRetryCount >= maxRetries
 			if !shouldFallback {
 				// Reset timer for next retry window
 				g.fixedFallbackDeadSince = nowNano
 			}
 			g.fixedFallbackMu.Unlock()
 
-			// Fire emergency probes on every timeout tick
+			// Fire emergency probes on every timeout tick, including the last one
+			// before fallback, so the node gets a resuscitation chance.
 			fixed.NotifyCheckTcp()
 			fixed.NotifyCheckDnsUdp()
 
-			if shouldFallback {
-				// Max retries reached → fallback to configured policy
-				g.logFixedFallback(-1, fixed, nt) // mark=-1: fallen_back
-				goto doFallback
+			if !shouldFallback {
+				// Still have retries left → keep using fixed node
+				g.logFixedFallback(10+newRetryCount, fixed, nt)
+				selected := preferAlternateSelectionNetworkType(fixed, nt)
+				return fixed, 0, selected, nil
 			}
 
-			// Still have retries left → log and keep using fixed node
-			g.logFixedFallback(10+int64(newRetryCount), fixed, nt)
-			selected := preferAlternateSelectionNetworkType(fixed, nt)
-			return fixed, 0, selected, nil
+			// Max retries reached → fallback to configured policy
+			g.logFixedFallback(-1, fixed, nt) // mark=-1: fallen_back
 
 		doFallback:
 			switch policy.FallbackPolicy {
