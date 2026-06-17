@@ -501,7 +501,9 @@ func (d *Dialer) aliveBackground() {
 	if d.CheckInterval == 0 {
 		if d.Log != nil {
 			d.Log.WithField("dialer", d.Property().Name).
-				Debugln("Connectivity check disabled (check_interval=0)")
+				Warnln("Connectivity check disabled: check_interval not configured. " +
+					"Nodes will not be health-checked. " +
+					"Add check_interval, tcp_check_url, and udp_check_dns to enable.")
 		}
 		return
 	}
