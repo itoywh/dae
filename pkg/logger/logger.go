@@ -13,15 +13,32 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+// cstLocation is the CST (UTC+8) timezone used for log timestamps.
+// On minimal OpenWrt/ImmortalWrt without tzdata, we use a fixed offset.
+var cstLocation *time.Location
+
 func init() {
-	// Always use CST (UTC+8) for log timestamps.
-	// On minimal OpenWrt/ImmortalWrt without tzdata, fall back to fixed offset.
-	// Note: logrus-prefixed-formatter uses time.Now() internally, which respects time.Local.
+	// Initialize CST location without modifying global time.Local.
+	// This ensures other packages' time operations are unaffected.
 	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
-		time.Local = loc
+		cstLocation = loc
 	} else {
-		time.Local = time.FixedZone("CST", 8*3600)
+		cstLocation = time.FixedZone("CST", 8*3600)
 	}
+}
+
+// cstFormatter wraps prefixed.TextFormatter to use CST timezone for timestamps.
+type cstFormatter struct {
+	*prefixed.TextFormatter
+}
+
+// Format overrides the timestamp formatting to use CST timezone.
+func (f *cstFormatter) Format(entry *logrus.Entry) ([]byte, error) {
+	// Convert entry.Time to CST before formatting
+	if !f.DisableTimestamp && entry.Time != (time.Time{}) {
+		entry.Time = entry.Time.In(cstLocation)
+	}
+	return f.TextFormatter.Format(entry)
 }
 
 func SetLogger(log *logrus.Logger, logLevel string, disableTimestamp bool, logFileOpt *lumberjack.Logger) {
@@ -31,11 +48,13 @@ func SetLogger(log *logrus.Logger, logLevel string, disableTimestamp bool, logFi
 	}
 
 	log.SetLevel(level)
-	log.SetFormatter(&prefixed.TextFormatter{
-		DisableTimestamp: disableTimestamp,
-		FullTimestamp:    true,
-		ForceFormatting:  true,
-		TimestampFormat:  "2006-01-02 15:04:05 CST",
+	log.SetFormatter(&cstFormatter{
+		TextFormatter: &prefixed.TextFormatter{
+			DisableTimestamp: disableTimestamp,
+			FullTimestamp:    true,
+			ForceFormatting:  true,
+			TimestampFormat:  "2006-01-02 15:04:05 CST",
+		},
 	})
 	if logFileOpt != nil {
 		log.SetOutput(logFileOpt)
