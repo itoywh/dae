@@ -13,12 +13,13 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-// cstLocation is the CST (UTC+8) location used for log timestamps.
-// Initialized once at package init with a graceful fallback for systems
-// without tzdata (e.g., minimal OpenWrt/ImmortalWrt builds).
+// cstLocation is the CST (UTC+8) timezone used for log timestamps.
+// On minimal OpenWrt/ImmortalWrt without tzdata, we use a fixed offset.
 var cstLocation *time.Location
 
 func init() {
+	// Initialize CST location without modifying global time.Local.
+	// This ensures other packages' time operations are unaffected.
 	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
 		cstLocation = loc
 	} else {
@@ -26,19 +27,16 @@ func init() {
 	}
 }
 
-// cstFormatter wraps prefixed.TextFormatter to use CST timezone for timestamps
-// without modifying the global time.Local, which would affect unrelated code.
+// cstFormatter wraps prefixed.TextFormatter to use CST timezone for timestamps.
 type cstFormatter struct {
 	*prefixed.TextFormatter
 }
 
 // Format overrides the timestamp formatting to use CST timezone.
 func (f *cstFormatter) Format(entry *logrus.Entry) ([]byte, error) {
-	// Create a copy of the entry to avoid modifying the shared entry object
+	// Convert entry.Time to CST before formatting
 	if !f.DisableTimestamp && entry.Time != (time.Time{}) {
-		modifiedEntry := *entry
-		modifiedEntry.Time = entry.Time.In(cstLocation)
-		return f.TextFormatter.Format(&modifiedEntry)
+		entry.Time = entry.Time.In(cstLocation)
 	}
 	return f.TextFormatter.Format(entry)
 }
