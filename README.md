@@ -14,10 +14,11 @@
 
 | 补丁 | 说明 |
 |------|------|
-| **P2** | FixedWithFallback 增强：修复延迟不跟踪 bug，新增 timeout+retry 重试（retries=0 立即 fallback）；紧急探针主动检测；纳秒级超时精度；互斥锁保护重试状态；8 个单元测试 |
-| **P3** | 健康检查完全配置化：移除默认值，opt-in；修复注释字段仍触发检查的 bug；禁用时输出 WARN 日志提醒 |
+| **P2** | FixedWithFallback 增强：修复延迟不跟踪 bug，新增 timeout+retry 重试 |
+|      | 紧急探针主动检测；纳秒级超时精度；互斥锁保护重试状态 |
+| **P3** | 健康检查完全配置化：移除默认值 opt-in；禁用时输出 WARN 日志提醒 |
 | **P4** | 节点状态日志：DEAD/ALIVE 变更输出 |
-| **P5** | 日志时区：CST (Asia/Shanghai)，时间戳 `2006-01-02 15:04:05`；使用 cstFormatter 避免修改全局 time.Local |
+| **P5** | 日志时区：CST (Asia/Shanghai)；使用 cstFormatter 避免修改全局 time.Local |
 
 **分支**: `v2.0-custom` · **预编译二进制**: [Releases](https://github.com/itoywh/dae/releases) · **PR**: [#1](https://github.com/itoywh/dae/pull/1)
 
