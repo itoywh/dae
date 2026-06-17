@@ -15,7 +15,8 @@
 | 补丁 | 说明 |
 |------|------|
 | **P2** | FixedWithFallback 增强：修复延迟不跟踪 bug，新增 timeout+retry 重试 |
-|      | 紧急探针主动检测；纳秒级超时精度；互斥锁保护重试状态 |
+|      | 紧急探针主动检测（最小间隔 2s）；纳秒级超时精度；互斥锁保护重试状态 |
+|      | `retries=0` 时立即 fallback，不等待 timeout |
 | **P3** | 健康检查完全配置化：移除默认值 opt-in；禁用时输出 WARN 日志提醒 |
 | **P4** | 节点状态日志：DEAD/ALIVE 变更输出 |
 | **P5** | 日志时区：CST (Asia/Shanghai)；使用 cstFormatter 避免修改全局 time.Local |
@@ -23,6 +24,24 @@
 **分支**: `v2.0-custom` · **预编译二进制**: [Releases](https://github.com/itoywh/dae/releases) · **PR**: [#1](https://github.com/itoywh/dae/pull/1)
 
 > 所有补丁仅修改 dialer 层，未触及 eBPF/reload 核心。
+
+### P2 详细说明
+
+**FixedWithFallback 策略语法**：`fixed_fallback(index, timeout, retries, fallback_policy)`
+
+**参数说明**：
+- `index`: 固定节点索引
+- `timeout`: 超时时间（支持亚秒级，如 `500ms`）
+- `retries`: 重试次数
+  - `retries=0`: 节点 dead 后立即 fallback，不等待 timeout
+  - `retries>0`: 每次 timeout 后发送紧急探针检测，最多重试 retries 次
+- `fallback_policy`: 备用策略（`random`、`min_last_latency` 等）
+
+**紧急探针机制**：
+- 节点 dead 后，每次 timeout 到达时主动发送 TCP/UDP 探针检测是否恢复
+- 探针最小间隔 **2s**（cooldown），防止探针风暴保护系统资源
+- 探针成功 → 立即恢复使用固定节点
+- 重试耗尽 → fallback 到备用策略
 
 ---
 
