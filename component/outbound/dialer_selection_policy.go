@@ -18,9 +18,9 @@ import (
 type DialerSelectionPolicy struct {
 	Policy               consts.DialerSelectionPolicy
 	FixedIndex           int
-	FixedFallbackTimeout time.Duration
-	FixedFallbackRetries int
-	FallbackPolicy       consts.DialerSelectionPolicy // default min_moving_avg
+	FixedFallbackTimeout time.Duration                // 节点超时时间
+	FixedFallbackRetries int                          // 超时重试次数
+	FallbackPolicy       consts.DialerSelectionPolicy // 重试耗尽后的回退策略，默认 min_moving_avg
 }
 
 func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *DialerSelectionPolicy, err error) {
@@ -143,7 +143,6 @@ func parsePolicyName(s string) (consts.DialerSelectionPolicy, error) {
 	}
 }
 
-// parseDurationWithUnit parses a duration string with unit suffix.
 // Supported: "ms" (milliseconds), "s" (seconds), "m" (minutes).
 // No suffix defaults to seconds for backward compatibility.
 func parseDurationWithUnit(s string) (time.Duration, error) {

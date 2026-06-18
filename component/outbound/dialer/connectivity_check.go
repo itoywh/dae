@@ -464,19 +464,13 @@ func getActiveDialerCount() int {
 	return poolActiveCount
 }
 
-// shouldSkipTcp6Probes returns true when tcp_check_url explicitly lists only IPv4
-// addresses (no explicit IPv6 entries).
-func shouldSkipTcp6Probes(raw []string) bool {
-	return shouldSkipIp6Probes(raw)
-}
-
-// shouldSkipUdp6Probes returns true when udp_check_dns explicitly lists only IPv4
-// addresses (no explicit IPv6 entries).
-func shouldSkipUdp6Probes(raw []string) bool {
-	return shouldSkipIp6Probes(raw)
-}
-
-func shouldSkipIp6Probes(raw []string) bool {
+// shouldSkipIpFamily6 returns true when raw explicitly lists only IPv4 addresses
+// (no explicit IPv6 entries). This avoids unnecessary IPv6 probes when the user's
+// network doesn't support IPv6.
+// Returns false (keep IPv6 probes) when:
+//   - Explicit IPv6 addresses are found in config
+//   - No explicit IPs are given (DNS resolution might return IPv6)
+func shouldSkipIpFamily6(raw []string) bool {
 	hasIpv6 := false
 	hasExplicitIpv4 := false
 	for i := 1; i < len(raw); i++ {
@@ -490,10 +484,8 @@ func shouldSkipIp6Probes(raw []string) bool {
 			hasExplicitIpv4 = true
 		}
 	}
-	if hasIpv6 {
-		return false
-	}
-	return hasExplicitIpv4
+
+	return hasExplicitIpv4 && !hasIpv6
 }
 
 func (d *Dialer) aliveBackground() {
@@ -608,8 +600,8 @@ func (d *Dialer) aliveBackground() {
 	var CheckOpts []*CheckOption
 	useTcpCheck := len(d.TcpCheckOptionRaw.Raw) > 0
 	useUdpDns := len(d.CheckDnsOptionRaw.Raw) > 0
-	skipTcp6 := useTcpCheck && shouldSkipTcp6Probes(d.TcpCheckOptionRaw.Raw)
-	skipUdp6 := useUdpDns && shouldSkipUdp6Probes(d.CheckDnsOptionRaw.Raw)
+	skipTcp6 := useTcpCheck && shouldSkipIpFamily6(d.TcpCheckOptionRaw.Raw)
+	skipUdp6 := useUdpDns && shouldSkipIpFamily6(d.CheckDnsOptionRaw.Raw)
 
 	if useTcpCheck {
 		CheckOpts = append(CheckOpts, tcp4CheckOpt)
