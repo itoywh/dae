@@ -582,6 +582,13 @@ func newControlPlaneWithContextOptions(
 		if err != nil {
 			return nil, fmt.Errorf("failed to create group %v: %w", group.Name, err)
 		}
+		// Warn if FixedWithFallback timeout is less than 2s.
+		if policy.Policy == consts.DialerSelectionPolicy_FixedWithFallback && policy.FixedFallbackTimeout < 2*time.Second {
+			log.Warnf("Group %q: FixedWithFallback timeout %v is less than 2s; "+
+				"effective probe interval will be 2s (cooldown) to prevent probe storms. "+
+				"Consider setting timeout >= 2s to avoid request blocking.",
+				group.Name, policy.FixedFallbackTimeout)
+		}
 		// Filter nodes with user given filters.
 		dialers, annos, err := dialerSet.FilterAndAnnotate(group.Filter, group.FilterAnnotation)
 		if err != nil {
