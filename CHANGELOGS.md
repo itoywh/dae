@@ -13,8 +13,26 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
 ## Releases
 
 <!-- BEGIN NEW TOC ENTRY -->
+- [v2.0-custom-v4 (2026-06-18)](#v20-custom-v4-2026-06-18)
 - [v2.0-custom-v3 (2026-06-17)](#v20-custom-v3-2026-06-17)
 <!-- END NEW TOC ENTRY -->
+
+### v2.0-custom-v4 (2026-06-18)
+
+> Release date: 2026/06/18
+
+#### Bug 修复
+
+- **P5 CST 时区优化**：修复 `cstFormatter.Format()` 中值拷贝问题，避免修改共享的 `logrus.Entry` 对象
+  - 使用值拷贝方式：`modifiedEntry := *entry`
+  - 避免对共享 entry 对象产生副作用
+
+#### 编译信息
+
+- Commit: `9796d14`
+- 编译时间: 2026-06-18 14:28 UTC
+
+---
 
 ### v2.0-custom-v3 (2026-06-17)
 
