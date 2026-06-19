@@ -84,6 +84,31 @@ func NewDialerGroup(
 	group.selectionState.Store(state)
 	group.cachedMinCheckInterval = group.MinCheckInterval()
 
+	// Register alive-transition callbacks on each dialer so that FixedWithFallback
+	// retry state (deadSince/retryCount) is reset immediately when the fixed dialer
+	// revives, rather than waiting for the next _select() call which may never arrive
+	// if traffic is flowing through the fallback path.
+	if p.Policy == consts.DialerSelectionPolicy_FixedWithFallback &&
+		p.FixedIndex >= 0 && p.FixedIndex < len(dialers) {
+		fixedDialer := dialers[p.FixedIndex]
+		fixedName := ""
+		if fp := fixedDialer.Property(); fp != nil {
+			fixedName = fp.Name
+		}
+		fixedDialer.RegisterAliveTransitionCallback(func(networkType *dialer.NetworkType, alive bool) {
+			if !alive {
+				return // Only care about DEAD→ALIVE transitions.
+			}
+			wasDead := group.fixedFallbackDeadSince.Swap(0) != 0
+			if !wasDead {
+				return // Was not in dead/retry state; nothing to do.
+			}
+			group.fixedFallbackRetryCount.Store(0)
+			group.logFixedFallback(logrus.InfoLevel, 0, fixedName,
+				"fixed dialer recovered, traffic returned")
+		})
+	}
+
 	for _, nt := range standardSelectionNetworkTypes() {
 		aliveChangeCallback(true, nt, true)
 	}
