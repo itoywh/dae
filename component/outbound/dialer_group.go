@@ -319,7 +319,7 @@ func (g *DialerGroup) logNoAlive(
 
 // logFixedFallback records state transitions for the fixed_fallback policy.
 // Mark values: 0=alive/recovery, 1=dead_detected, >=10=retry step,
-// -1=fallen back to alternative. Rate-limited to 10s.
+// -1=fallen back to alternative.
 func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *dialer.NetworkType) {
 	if g.log == nil {
 		return
@@ -333,7 +333,7 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 	case state == 0:
 		// Recovery: fixed dialer is alive again
 		old := g.fixedFallbackLastLogMark.Swap(0)
-		if old != 0 && g.tryDoRateLimitedAction(&g.fixedFallbackLastLogTime, 10*time.Second) {
+		if old != 0 {
 			g.log.WithFields(logrus.Fields{
 				"group":   g.Name,
 				"dialer":  nodeName,
@@ -343,7 +343,7 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 	case state == 1:
 		// First time detecting dead: log and update state
 		old := g.fixedFallbackLastLogMark.Swap(1)
-		if old != 1 && g.tryDoRateLimitedAction(&g.fixedFallbackLastLogTime, 10*time.Second) {
+		if old != 1 {
 			g.log.WithFields(logrus.Fields{
 				"group":   g.Name,
 				"dialer":  nodeName,
@@ -354,7 +354,7 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 		// Retry: log the actual retry count (state - 10)
 		retryCount := state - 10
 		old := g.fixedFallbackLastLogMark.Swap(state)
-		if old != state && g.tryDoRateLimitedAction(&g.fixedFallbackLastLogTime, 10*time.Second) {
+		if old != state {
 			g.log.WithFields(logrus.Fields{
 				"group":   g.Name,
 				"dialer":  nodeName,
@@ -364,7 +364,7 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 	case state < 0:
 		// Fallen back to alternative
 		old := g.fixedFallbackLastLogMark.Swap(-1)
-		if old >= 0 && g.tryDoRateLimitedAction(&g.fixedFallbackLastLogTime, 10*time.Second) {
+		if old >= 0 {
 			g.log.WithFields(logrus.Fields{
 				"group":   g.Name,
 				"dialer":  nodeName,
