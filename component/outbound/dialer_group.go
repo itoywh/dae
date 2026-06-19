@@ -41,9 +41,10 @@ type DialerGroup struct {
 	noAliveLogLastTimes [8]atomic.Int64
 
 	// fixed_fallback retry state (protected by fixedFallbackMu)
-	fixedFallbackMu         sync.Mutex
-	fixedFallbackDeadSince  int64
-	fixedFallbackRetryCount int64
+	fixedFallbackMu            sync.Mutex
+	fixedFallbackDeadSince     int64
+	fixedFallbackRetryCount    int64
+	fixedFallbackLastRetryNano int64
 
 	// fixed_fallback log rate limit
 	fixedFallbackLastLogMark atomic.Int64
@@ -524,10 +525,17 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				return fixed, 0, selected, nil
 			}
 
-			// Timeout passed → increment retry count
-			newRetryCount = retryCount + 1
-			g.fixedFallbackRetryCount = newRetryCount
-			shouldFallback = newRetryCount >= maxRetries
+			// Timeout passed → dedup-protected retry count increment.
+			// Multiple networkTypes may trigger _select concurrently and
+			// share the same retry state; requiring FixedFallbackTimeout/2
+			// between increments prevents batch-advance of the counter.
+			if nowNano-g.fixedFallbackLastRetryNano > int64(policy.FixedFallbackTimeout)/2 {
+				newRetryCount = retryCount + 1
+				g.fixedFallbackRetryCount = newRetryCount
+				g.fixedFallbackLastRetryNano = nowNano
+				shouldFallback = newRetryCount >= maxRetries
+			}
+			// else: dedup blocks → shouldFallback stays false, timer resets below
 			if !shouldFallback {
 				// Reset timer for next retry window
 				g.fixedFallbackDeadSince = nowNano
