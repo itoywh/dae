@@ -230,7 +230,7 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 	}
 	var lastRes *proxyDialResult
 	var lastErr error
-	for attempt := range 2 {
+	for attempt := 0; attempt < 32; attempt++ {
 		res, err := c.chooseProxyDialer(ctx, p)
 		if err != nil {
 			return nil, res, err
@@ -241,15 +241,36 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 		conn, err := res.Dialer.DialContext(dialCtx, res.Network, res.DialTarget)
 		cancel()
 		if err == nil {
+			if res.Outbound.GetSelectionPolicy() == consts.DialerSelectionPolicy_FixedWithFallback {
+				res.Outbound.FixedDialerSucceeded(res.Dialer, res.SelectionNetworkTypeObj)
+			}
 			return conn, res, nil
 		}
 		lastErr = err
-		if attempt > 0 || !shouldForceMarkUnavailableOnProxyDialError(err) {
-			l4proto := consts.L4ProtoStr(p.Network)
-			if res.SelectionNetworkTypeObj != nil {
-				l4proto = res.SelectionNetworkTypeObj.L4Proto
+
+		l4proto := consts.L4ProtoStr(p.Network)
+		if res.SelectionNetworkTypeObj != nil {
+			l4proto = res.SelectionNetworkTypeObj.L4Proto
+		}
+		notifyProxyDialerHealthCheck(res.Dialer, l4proto, err)
+
+		// For fixed_fallback, drive retry counting from actual dial attempts.
+		// Each failed attempt advances the retry state; when retries/time are
+		// exhausted we mark the fixed dialer unavailable and let the next
+		// selection pick the fallback policy.
+		if res.Outbound.GetSelectionPolicy() == consts.DialerSelectionPolicy_FixedWithFallback && res.SelectionNetworkTypeObj != nil {
+			fallbackNow := res.Outbound.FixedDialerFailed(res.Dialer, res.SelectionNetworkTypeObj)
+			if !fallbackNow {
+				continue
 			}
-			notifyProxyDialerHealthCheck(res.Dialer, l4proto, err)
+			res.Dialer.ReportUnavailableForced(
+				res.SelectionNetworkTypeObj,
+				fmt.Errorf("fixed_fallback proxy dial failed: %w", err),
+			)
+			continue
+		}
+
+		if attempt > 0 || !shouldForceMarkUnavailableOnProxyDialError(err) {
 			return nil, res, err
 		}
 		if res.SelectionNetworkTypeObj != nil {

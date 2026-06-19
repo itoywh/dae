@@ -570,8 +570,13 @@ func TestDialerGroup_Select_FixedWithFallback_DeadFallback(t *testing.T) {
 		g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(d, false)
 	}
 
-	// First select: fixed dialer dead → start retry (retries exhausted immediately since retries=1)
-	// After retries exhausted, fallback kicks in.
+	// Simulate one actual dial failure on the fixed dialer. With retries=1,
+	// that single attempt exhausts the retry budget and triggers fallback.
+	if !g.FixedDialerFailed(dialers[1], TestNetworkType) {
+		t.Fatalf("FixedDialerFailed should signal fallback after exhausting retries=1")
+	}
+
+	// First select: fallback should already be active.
 	selected, _, err := g.Select(TestNetworkType, false)
 	if err != nil {
 		t.Fatalf("Select() error = %v", err)
@@ -594,6 +599,12 @@ func TestDialerGroup_Select_FixedWithFallback_ZeroRetriesNoFallback(t *testing.T
 	dialers[0].MustGetLatencies10(TestNetworkType).AppendLatency(100 * time.Millisecond)
 	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[0], true)
 	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[1], false)
+
+	// With retries=0, the first simulated dial failure immediately exhausts the
+	// retry budget and forces fallback.
+	if !g.FixedDialerFailed(dialers[1], TestNetworkType) {
+		t.Fatalf("FixedDialerFailed should signal fallback immediately with retries=0")
+	}
 
 	// With retries=0, first dead detection immediately falls back.
 	selected, _, err := g.Select(TestNetworkType, false)
@@ -650,7 +661,7 @@ func TestDialerGroup_Select_FixedWithFallback_RetryTimeoutBehavior(t *testing.T)
 	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[0], true)
 	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[1], false)
 
-	// First call: deadSince set, retry 0. Fixed dialer returned.
+	// First call: deadSince set, retry state starts. Fixed dialer returned.
 	d, _, _ := g.Select(TestNetworkType, false)
 	if d != dialers[1] {
 		t.Fatalf("first select: expected fixed (dead detected), got %v", d)
@@ -663,12 +674,85 @@ func TestDialerGroup_Select_FixedWithFallback_RetryTimeoutBehavior(t *testing.T)
 		t.Fatalf("select within timeout: expected fixed, got %v", d)
 	}
 
-	// After timeout + retries exhausted, fallback to dialers[0].
-	// retries=1 at first timeout, retries=2 at second, retries=3 at third → exhausted.
-	// Wait long enough for 3 timeouts to pass.
-	time.Sleep(7 * time.Second)
+	// After the global timeout window passes (and no successful dial attempts have
+	// been recorded), _select falls back even though the retry counter is still 0.
+	time.Sleep(2 * time.Second)
 	d, _, _ = g.Select(TestNetworkType, false)
 	if d == dialers[1] {
-		t.Fatalf("after retries exhausted: expected fallback, still got fixed dialer")
+		t.Fatalf("after timeout window: expected fallback, still got fixed dialer")
+	}
+}
+
+func TestDialerGroup_FixedWithFallback_RetryCountDrivesFallback(t *testing.T) {
+	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{
+		Policy:               consts.DialerSelectionPolicy_FixedWithFallback,
+		FixedIndex:           1,
+		FixedFallbackTimeout: 10 * time.Second, // Long timeout so retries dominate
+		FixedFallbackRetries: 3,
+		FallbackPolicy:       consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+	})
+
+	// Fixed dialer dead; others alive for fallback.
+	dialers[0].MustGetLatencies10(TestNetworkType).AppendLatency(50 * time.Millisecond)
+	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[0], true)
+	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[1], false)
+
+	// First two failed dial attempts should not trigger fallback yet.
+	if g.FixedDialerFailed(dialers[1], TestNetworkType) {
+		t.Fatalf("first failed dial should not trigger fallback")
+	}
+	if g.FixedDialerFailed(dialers[1], TestNetworkType) {
+		t.Fatalf("second failed dial should not trigger fallback")
+	}
+
+	// Third failed dial exhausts retries=3 and triggers fallback.
+	if !g.FixedDialerFailed(dialers[1], TestNetworkType) {
+		t.Fatalf("third failed dial should trigger fallback")
+	}
+
+	// Subsequent selects should use the fallback path.
+	selected, _, err := g.Select(TestNetworkType, false)
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if selected == dialers[1] {
+		t.Fatalf("expected fallback after retry budget exhausted, got fixed dialer")
+	}
+}
+
+func TestDialerGroup_FixedWithFallback_SucceededResetsRetryState(t *testing.T) {
+	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{
+		Policy:               consts.DialerSelectionPolicy_FixedWithFallback,
+		FixedIndex:           1,
+		FixedFallbackTimeout: 10 * time.Second,
+		FixedFallbackRetries: 3,
+		FallbackPolicy:       consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+	})
+
+	// Mark fixed dialer dead, others alive.
+	dialers[0].MustGetLatencies10(TestNetworkType).AppendLatency(50 * time.Millisecond)
+	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[0], true)
+	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[1], false)
+
+	// Use up two retry attempts but not fall back.
+	if g.FixedDialerFailed(dialers[1], TestNetworkType) {
+		t.Fatalf("first failed dial should not trigger fallback")
+	}
+	if g.FixedDialerFailed(dialers[1], TestNetworkType) {
+		t.Fatalf("second failed dial should not trigger fallback")
+	}
+
+	// A successful dial resets the retry state.
+	g.FixedDialerSucceeded(dialers[1], TestNetworkType)
+
+	// After reset, it should take another 3 failures to fall back.
+	if g.FixedDialerFailed(dialers[1], TestNetworkType) {
+		t.Fatalf("first failed dial after reset should not trigger fallback")
+	}
+	if g.FixedDialerFailed(dialers[1], TestNetworkType) {
+		t.Fatalf("second failed dial after reset should not trigger fallback")
+	}
+	if !g.FixedDialerFailed(dialers[1], TestNetworkType) {
+		t.Fatalf("third failed dial after reset should trigger fallback")
 	}
 }
