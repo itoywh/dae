@@ -547,9 +547,11 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			fixed.NotifyCheckTcp()
 			fixed.NotifyCheckDnsUdp()
 
+			// Log every retry, including the last one before fallback.
+			g.logFixedFallback(10+newRetryCount, fixed, nt)
+
 			if !shouldFallback {
 				// Still have retries left → keep using fixed node
-				g.logFixedFallback(10+newRetryCount, fixed, nt)
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
 				return fixed, 0, selected, nil
 			}
