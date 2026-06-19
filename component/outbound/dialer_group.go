@@ -453,6 +453,13 @@ func (g *DialerGroup) FixedDialerFailed(d *dialer.Dialer, networkType *dialer.Ne
 	return false
 }
 
+// Select selects a dialer from group according to selectionPolicy. It is a
+// convenience wrapper around SelectWithExclusion with no excluded dialer.
+// If 'strictIpVersion' is false and no alive dialer, it will fallback to another ipversion.
+func (g *DialerGroup) Select(networkType *dialer.NetworkType, strictIpVersion bool) (d *dialer.Dialer, latency time.Duration, err error) {
+	return g.SelectWithExclusion(networkType, strictIpVersion, nil)
+}
+
 // SelectWithExclusion selects a dialer from group according to selectionPolicy.
 // The 'excluded' parameter specifies a dialer to avoid during selection (for
 // failover scenarios). Note that Fixed policy ignores 'excluded' because user
