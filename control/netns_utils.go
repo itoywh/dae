@@ -163,7 +163,14 @@ func (ns *DaeNetns) WithBestEffort(op string, f func() error) {
 }
 
 // supportsNetkit checks if the kernel supports Netkit devices (requires 6.7+).
+// Set DAE_DISABLE_NETKIT=1 env var to force veth fallback (workaround for #1024).
 func (ns *DaeNetns) supportsNetkit() bool {
+	if os.Getenv("DAE_DISABLE_NETKIT") == "1" {
+		if ns.log != nil {
+			ns.log.Warn("Netkit disabled by DAE_DISABLE_NETKIT=1 env var; falling back to veth")
+		}
+		return false
+	}
 	if ns.kernelVersion == nil {
 		return false
 	}
