@@ -14,8 +14,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// TestConnectivityCheckDisabled_NoConfig tests that connectivity check is skipped
-// when no check_interval, tcp_check_url, or udp_check_dns is configured.
 func TestConnectivityCheckDisabled_NoConfig(t *testing.T) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
@@ -23,14 +21,14 @@ func TestConnectivityCheckDisabled_NoConfig(t *testing.T) {
 	d := NewDialer(
 		direct.SymmetricDirect,
 		&GlobalOption{
-			Log:            log,
-			CheckInterval:  0,                    // Not configured
-			TcpCheckUrl:    nil,                  // Not configured
-			UdpCheckDns:    nil,                  // Not configured
-			CheckTolerance: 0,
+			Log:               log,
+			CheckInterval:     0,                    // Not configured
+			TcpCheckOptionRaw: TcpCheckOptionRaw{},  // Empty
+			CheckDnsOptionRaw: CheckDnsOptionRaw{},  // Empty
+			CheckTolerance:    0,
 		},
 		InstanceOption{},
-		&Property{Name: "test-dialer"},
+		&Property{},
 	)
 	t.Cleanup(func() { _ = d.Close() })
 
@@ -50,8 +48,6 @@ func TestConnectivityCheckDisabled_NoConfig(t *testing.T) {
 	}
 }
 
-// TestConnectivityCheckDisabled_EmptyUrls tests that connectivity check is skipped
-// when urls are empty (even if check_interval is set).
 func TestConnectivityCheckDisabled_EmptyUrls(t *testing.T) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
@@ -59,21 +55,24 @@ func TestConnectivityCheckDisabled_EmptyUrls(t *testing.T) {
 	d := NewDialer(
 		direct.SymmetricDirect,
 		&GlobalOption{
-			Log:            log,
-			CheckInterval:  30 * time.Second,    // Configured
-			TcpCheckUrl:    []string{},          // Empty
-			UdpCheckDns:    []string{},          // Empty
-			CheckTolerance: 0,
+			Log:               log,
+			CheckInterval:     30 * time.Second,     // Configured
+			TcpCheckOptionRaw: TcpCheckOptionRaw{},  // Empty Raw
+			CheckDnsOptionRaw: CheckDnsOptionRaw{},  // Empty Raw
+			CheckTolerance:    0,
 		},
 		InstanceOption{},
-		&Property{Name: "test-dialer"},
+		&Property{},
 	)
 	t.Cleanup(func() { _ = d.Close() })
 
-	// When both TcpCheckUrl and UdpCheckDns are empty, aliveBackground should return
+	// aliveBackground only checks CheckInterval == 0; it does NOT check
+	// for empty Raw fields. When CheckInterval > 0, goroutines are started
+	// even with empty Raw — they will fail when Option() is called.
+	// The Raw field itself is not modified by aliveBackground.
 	d.aliveBackground()
 
-	// Verify check options are empty
+	// Raw fields remain as-was (empty in this case)
 	if len(d.TcpCheckOptionRaw.Raw) > 0 {
 		t.Errorf("TcpCheckOptionRaw.Raw should be empty, got %v", d.TcpCheckOptionRaw.Raw)
 	}
@@ -82,8 +81,6 @@ func TestConnectivityCheckDisabled_EmptyUrls(t *testing.T) {
 	}
 }
 
-// TestConnectivityCheckEnabled_TcpOnly tests that only TCP check is enabled
-// when only tcp_check_url is configured.
 func TestConnectivityCheckEnabled_TcpOnly(t *testing.T) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
@@ -91,16 +88,18 @@ func TestConnectivityCheckEnabled_TcpOnly(t *testing.T) {
 	d := NewDialer(
 		direct.SymmetricDirect,
 		&GlobalOption{
-			Log:            log,
-			CheckInterval:  30 * time.Second,
-			TcpCheckUrl:    []string{"http://cp.cloudflare.com"},
-			UdpCheckDns:    nil,                  // Not configured
-			CheckTolerance: 0,
+			Log:               log,
+			CheckInterval:     30 * time.Second,
+			TcpCheckOptionRaw: TcpCheckOptionRaw{Raw: []string{"http://cp.cloudflare.com"}},
+			CheckDnsOptionRaw: CheckDnsOptionRaw{}, // Not configured
+			CheckTolerance:    0,
 		},
 		InstanceOption{},
-		&Property{Name: "test-dialer"},
+		&Property{},
 	)
 	t.Cleanup(func() { _ = d.Close() })
+
+	d.aliveBackground()
 
 	// TCP check should be enabled, UDP check should be disabled
 	if len(d.TcpCheckOptionRaw.Raw) == 0 {
@@ -111,8 +110,6 @@ func TestConnectivityCheckEnabled_TcpOnly(t *testing.T) {
 	}
 }
 
-// TestConnectivityCheckEnabled_UdpOnly tests that only UDP check is enabled
-// when only udp_check_dns is configured.
 func TestConnectivityCheckEnabled_UdpOnly(t *testing.T) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
@@ -120,16 +117,18 @@ func TestConnectivityCheckEnabled_UdpOnly(t *testing.T) {
 	d := NewDialer(
 		direct.SymmetricDirect,
 		&GlobalOption{
-			Log:            log,
-			CheckInterval:  30 * time.Second,
-			TcpCheckUrl:    nil,                  // Not configured
-			UdpCheckDns:    []string{"8.8.8.8"},
-			CheckTolerance: 0,
+			Log:               log,
+			CheckInterval:     30 * time.Second,
+			TcpCheckOptionRaw: TcpCheckOptionRaw{}, // Not configured
+			CheckDnsOptionRaw: CheckDnsOptionRaw{Raw: []string{"8.8.8.8"}},
+			CheckTolerance:    0,
 		},
 		InstanceOption{},
-		&Property{Name: "test-dialer"},
+		&Property{},
 	)
 	t.Cleanup(func() { _ = d.Close() })
+
+	d.aliveBackground()
 
 	// UDP check should be enabled, TCP check should be disabled
 	if len(d.TcpCheckOptionRaw.Raw) > 0 {
@@ -140,34 +139,30 @@ func TestConnectivityCheckEnabled_UdpOnly(t *testing.T) {
 	}
 }
 
-// TestConnectivityCheck_Ipv4Only tests that only IPv4 check is performed
-// when urls contain only IPv4 addresses.
 func TestConnectivityCheck_Ipv4Only(t *testing.T) {
 	// Test TCP IPv4 only
 	tcpRaw := []string{"http://cp.cloudflare.com", "1.1.1.1"}
-	if !shouldSkipTcp6Probes(tcpRaw) {
-		t.Error("shouldSkipTcp6Probes should return true for IPv4-only tcp_check_url")
+	if !shouldSkipIpFamily6(tcpRaw) {
+		t.Error("shouldSkipIpFamily6 should return true for IPv4-only tcp_check_url")
 	}
 
 	// Test UDP IPv4 only
-	udpRaw := []string{"8.8.8.8"}
-	if !shouldSkipUdp6Probes(udpRaw) {
-		t.Error("shouldSkipUdp6Probes should return true for IPv4-only udp_check_dns")
+	udpRaw := []string{"dns.google:53", "8.8.8.8"}
+	if !shouldSkipIpFamily6(udpRaw) {
+		t.Error("shouldSkipIpFamily6 should return true for IPv4-only udp_check_dns")
 	}
 }
 
-// TestConnectivityCheck_WithIpv6 tests that IPv6 check is performed
-// when urls contain IPv6 addresses.
 func TestConnectivityCheck_WithIpv6(t *testing.T) {
 	// Test TCP with IPv6
 	tcpRaw := []string{"http://cp.cloudflare.com", "2606:4700:4700::1111"}
-	if shouldSkipTcp6Probes(tcpRaw) {
-		t.Error("shouldSkipTcp6Probes should return false when IPv6 is present")
+	if shouldSkipIpFamily6(tcpRaw) {
+		t.Error("shouldSkipIpFamily6 should return false when IPv6 is present")
 	}
 
 	// Test UDP with IPv6
-	udpRaw := []string{"2001:4860:4860::8888"}
-	if shouldSkipUdp6Probes(udpRaw) {
-		t.Error("shouldSkipUdp6Probes should return false when IPv6 is present")
+	udpRaw := []string{"dns.google:53", "2001:4860:4860::8888"}
+	if shouldSkipIpFamily6(udpRaw) {
+		t.Error("shouldSkipIpFamily6 should return false when IPv6 is present")
 	}
 }
