@@ -465,12 +465,18 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				return fixed, 0, selected, nil
 			}
 
-			// Fixed dialer is dead → fallback.
-			// Retries are handled by the background goroutine.
+			// Fixed dialer is dead. Apply retry logic with nanosecond precision
+			// and mutex-protected state reads/writes to avoid race conditions.
+			// Pre-declare all variables for goto compatibility (Go forbids
+			// jumping over variable declarations).
 			var (
 				nowNano       int64
 				deadSinceNano int64
+				retryCount    int64
+				elapsed       time.Duration
+				newRetryCount int64
 				maxRetries    int64
+				shouldFallback bool
 			)
 
 			maxRetries = int64(policy.FixedFallbackRetries)
@@ -478,15 +484,19 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			g.fixedFallbackMu.Lock()
 			nowNano = time.Now().UnixNano()
 			deadSinceNano = g.fixedFallbackDeadSince
+			retryCount = g.fixedFallbackRetryCount
 
 			if deadSinceNano == 0 {
 				// First Select() finding this node dead.
-				// Start the background retry goroutine.
 				g.fixedFallbackDeadSince = nowNano
 				g.fixedFallbackRetryCount = 0
 				g.fixedFallbackMu.Unlock()
 				g.logFixedFallback(1, fixed, nt)
 
+				// Start background retry timer if not already running.
+				// This drives the timeout × retries cycle independently
+				// of traffic — probes fire every FixedFallbackTimeout,
+				// and after maxRetries the node is marked for fallback.
 				if g.fixedFallbackRunning.CompareAndSwap(false, true) {
 					g.fixedFallbackStopCh = make(chan struct{})
 					go g.runFixedFallbackRetry(fixed, policy, nt)
@@ -496,15 +506,58 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 					goto doFallback
 				}
 
-				// First timeout window: keep using fixed node.
+				// For the first timeout window, keep using the fixed node.
+				// The background goroutine will advance retries.
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
 				return fixed, 0, selected, nil
 			}
 
-			// Node already known dead. Background goroutine owns retries.
-			// Fallback immediately — no retryCount/elapsed check.
+			elapsed = time.Duration(nowNano - deadSinceNano)
+
+			// If elapsed >= timeout × retries, the background goroutine
+			// has already exhausted all retries — fallback immediately.
+			if retryCount >= maxRetries ||
+				elapsed >= policy.FixedFallbackTimeout*time.Duration(maxRetries) {
+				g.fixedFallbackMu.Unlock()
+				g.logFixedFallback(-1, fixed, nt)
+				goto doFallback
+			}
+
+			if elapsed < policy.FixedFallbackTimeout {
+				// Still within timeout window → keep using fixed node.
+				// The background goroutine is handling retries.
+				g.fixedFallbackMu.Unlock()
+				selected := preferAlternateSelectionNetworkType(fixed, nt)
+				return fixed, 0, selected, nil
+			}
+
+			// Timeout passed → dedup-protected retry count increment.
+			// The background goroutine also advances this counter,
+			// so this path is for concurrent Select() calls.
+			if nowNano-g.fixedFallbackLastRetryNano > int64(policy.FixedFallbackTimeout)/2 {
+				newRetryCount = retryCount + 1
+				g.fixedFallbackRetryCount = newRetryCount
+				g.fixedFallbackLastRetryNano = nowNano
+				shouldFallback = newRetryCount >= maxRetries
+			}
+			if !shouldFallback {
+				g.fixedFallbackDeadSince = nowNano
+			}
 			g.fixedFallbackMu.Unlock()
-			g.logFixedFallback(-1, fixed, nt)
+
+			fixed.NotifyCheckTcp()
+			fixed.NotifyCheckDnsUdp()
+
+			g.logFixedFallback(10+newRetryCount, fixed, nt)
+
+			if !shouldFallback {
+				// Still have retries left → keep using fixed node
+				selected := preferAlternateSelectionNetworkType(fixed, nt)
+				return fixed, 0, selected, nil
+			}
+
+			// Max retries reached → fallback to configured policy
+			g.logFixedFallback(-1, fixed, nt) // mark=-1: fallen_back
 			goto doFallback
 
 		doFallback:
