@@ -512,8 +512,10 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				//
 				// Skip retries and fallback immediately to the configured
 				// fallback policy (random / min_moving_avg / min).
-				g.fixedFallbackDeadSince = nowNano
-				g.fixedFallbackRetryCount = maxRetries
+				// We intentionally do NOT set fixedFallbackDeadSince here so
+				// subsequent Select() calls within the same "dead" window
+				// also hit this path and fallback immediately, rather than
+				// waiting timeout × retries behind a stale timer.
 				g.fixedFallbackMu.Unlock()
 				g.logFixedFallback(-1, fixed, nt)
 				goto doFallback
