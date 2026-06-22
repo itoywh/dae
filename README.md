@@ -32,7 +32,7 @@
 
 **参数说明**：
 - `index`: 固定节点索引（从0开始，严格按 `node {}` 书写顺序）
-- `timeout`: 单次重试间隔（支持亚秒级，如 `500ms`；实际最小间隔 **2s**，防止探针风暴）
+- `timeout`: 单次重试间隔（支持亚秒级，如 `500ms`；低于 2s 自动抬升到 2s 并输出 WARN 日志，防止探针风暴）
 - `retries`: 最大重试次数
   - `retries=0`: 节点 dead 后立即 fallback，不等待 timeout
   - `retries>0`: 后台 goroutine 按 timeout 间隔驱动重试探测
@@ -112,7 +112,7 @@ goroutine ticker 触发:
 - **aliveTransitionCallback**：健康检查（connectivity_check）标记 TCP dead 时自动启动 goroutine，不依赖自然流量触发
 - **deadSince 时间戳**：`fixedFallbackDeadSince` 记录首次发现死亡的时刻，用于区分首次 vs 后续 Select()
 - **CompareAndSwap**：保证仅一个 goroutine 在运行，`fixedFallbackStopCh` 用于 goroutine 退出时信号传递
-- **探针 cooldown**：由 `timeout` 参数决定，内置间隔 >= 2s（当 timeout < 2s 时自动抬升到 2s），防止探针风暴
+- **探针 cooldown**：timeout 或 check_interval 低于 2s 时自动抬升到 2s 并输出 WARN 日志，防止探针风暴
 - **恢复后清除状态**：`MustGetAlive=true` 同时清除 `deadSince` 和 `retryCount`，确保状态干净
 - **支持 UDP-only 检测**：不限于 TCP 类型的健康检查，UDP/DNS-UDP/Data-UDP 的 dead transition 同样触发 goroutine
 
@@ -123,7 +123,7 @@ goroutine ticker 触发:
 
 **Parameters**:
 - `index`: Fixed node index (0-based, in `node {}` declaration order)
-- `timeout`: Retry interval (supports sub-second, e.g. `500ms`; effective minimum is **2s**, prevents probe storm)
+- `timeout`: Retry interval (supports sub-second, e.g. `500ms`; below 2s clamped to 2s with WARN log, prevents probe storm)
 - `retries`: Max retry attempts
   - `retries=0`: Immediately fallback on dead, no timeout wait
   - `retries>0`: Background goroutine drives retry probes at `timeout` intervals
@@ -195,7 +195,7 @@ Health check or goroutine probe detects recovery → MustGetAlive=true
 - **aliveTransitionCallback**: Health check (`connectivity_check`) on TCP dead transition automatically starts the goroutine — no traffic required
 - **deadSince Timestamp**: `fixedFallbackDeadSince` records when death was first observed, distinguishing first vs subsequent Select()
 - **CompareAndSwap**: Ensures exactly one goroutine runs; `fixedFallbackStopCh` signals goroutine exit
-- **Probe Cooldown**: Governed by `timeout` parameter (minimum 2s in effect), prevents probe storm
+- **Probe Cooldown**: timeout or check_interval below 2s is clamped to 2s with a WARN log, prevents probe storm
 - **State Cleanup on Revive**: `MustGetAlive=true` clears both `deadSince` and `retryCount`
 - **UDP-only Support**: Not limited to TCP health checks — UDP/DNS-UDP/Data-UDP dead transitions also trigger the goroutine
 
