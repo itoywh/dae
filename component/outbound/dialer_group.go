@@ -499,30 +499,24 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			deadSinceNano = g.fixedFallbackDeadSince
 			retryCount = g.fixedFallbackRetryCount
 
-				if deadSinceNano == 0 {
-				// Node is dead but fixedFallbackDeadSince was never set.
-				// This happens when the *health check* (not traffic) set
-				// Alive=false — the DialerGroup's retry state was never
-				// notified. Since we don't know when the node died (could
-				// have been hours ago), there is no point waiting a full
-				// timeout before starting retries.
+			if deadSinceNano == 0 {
+				// Node is dead (MustGetAlive=false) but fixedFallbackDeadSince
+				// was never set. This happens when the health check / traffic
+				// failure path set collection.Alive=false but the DialerGroup's
+				// retry state was not notified.
 				//
-				// Fix: backdate deadSince by one timeout so the next
-				// Select() enters the elapsed >= timeout path immediately.
-				// This preserves the configured retry count (retryCount=0)
-				// but skips the initial 3s dead wait.
-				g.fixedFallbackDeadSince = nowNano - int64(policy.FixedFallbackTimeout)
-				g.fixedFallbackRetryCount = 0
+				// Since we don't know when the node actually died, and the
+				// health check has already confirmed it is unreachable, there
+				// is no point running the timeout × retries cycle now — the
+				// node's dead state is already authoritative.
+				//
+				// Skip retries and fallback immediately to the configured
+				// fallback policy (random / min_moving_avg / min).
+				g.fixedFallbackDeadSince = nowNano
+				g.fixedFallbackRetryCount = maxRetries
 				g.fixedFallbackMu.Unlock()
-				g.logFixedFallback(1, fixed, nt)
-
-				// Trigger emergency probes immediately
-				fixed.NotifyCheckTcp()
-				fixed.NotifyCheckDnsUdp()
-
-				// On next Select: elapsed >= timeout → retryCount=1 → probe → ...
-				selected := preferAlternateSelectionNetworkType(fixed, nt)
-				return fixed, 0, selected, nil
+				g.logFixedFallback(-1, fixed, nt)
+				goto doFallback
 			}
 
 			elapsed = time.Duration(nowNano - deadSinceNano)
