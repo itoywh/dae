@@ -499,20 +499,28 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			deadSinceNano = g.fixedFallbackDeadSince
 			retryCount = g.fixedFallbackRetryCount
 
-			if deadSinceNano == 0 {
-				// First time detecting dead → record time
-				g.fixedFallbackDeadSince = nowNano
+				if deadSinceNano == 0 {
+				// Node is dead but fixedFallbackDeadSince was never set.
+				// This happens when the *health check* (not traffic) set
+				// Alive=false — the DialerGroup's retry state was never
+				// notified. Since we don't know when the node died (could
+				// have been hours ago), there is no point waiting a full
+				// timeout before starting retries.
+				//
+				// Fix: backdate deadSince by one timeout so the next
+				// Select() enters the elapsed >= timeout path immediately.
+				// This preserves the configured retry count (retryCount=0)
+				// but skips the initial 3s dead wait.
+				g.fixedFallbackDeadSince = nowNano - int64(policy.FixedFallbackTimeout)
 				g.fixedFallbackRetryCount = 0
 				g.fixedFallbackMu.Unlock()
-				g.logFixedFallback(1, fixed, nt) // mark=1: dead_detected
+				g.logFixedFallback(1, fixed, nt)
 
-				// If retries is 0, skip retry logic and immediately fallback
-				if maxRetries <= 0 {
-					g.logFixedFallback(-1, fixed, nt) // mark=-1: fallen_back
-					goto doFallback
-				}
+				// Trigger emergency probes immediately
+				fixed.NotifyCheckTcp()
+				fixed.NotifyCheckDnsUdp()
 
-				// Otherwise keep using fixed node for now
+				// On next Select: elapsed >= timeout → retryCount=1 → probe → ...
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
 				return fixed, 0, selected, nil
 			}
@@ -558,6 +566,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 
 			// Max retries reached → fallback to configured policy
 			g.logFixedFallback(-1, fixed, nt) // mark=-1: fallen_back
+			goto doFallback
 
 		doFallback:
 			switch policy.FallbackPolicy {
