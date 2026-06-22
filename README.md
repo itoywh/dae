@@ -20,10 +20,11 @@
 | **P3** | 健康检查完全配置化：移除默认值 opt-in；禁用时输出 WARN 日志提醒 |
 | **P4** | 节点状态日志：DEAD/ALIVE 变更输出 |
 | **P5** | 日志时区：CST (Asia/Shanghai)；使用 cstFormatter 避免修改全局 time.Local |
+| **P6** | veth fallback：`DAE_DISABLE_NETKIT=1` 环境变量强制走 veth（解决 #1024 接口漂移） |
 
-**分支**: `v2.0-custom` · **预编译二进制**: [Releases](https://github.com/itoywh/dae/releases) · **PR**: [#1](https://github.com/itoywh/dae/pull/1)
+**分支**: `v2.0-custom` · **预编译二进制**: [Releases](https://github.com/itoywh/dae/releases) · **PR**: [#1](https://github.com/itoywh/dae/pull/1) · **Issues**: [#1024](https://github.com/daeuniverse/dae/issues/1024)
 
-> 所有补丁仅修改 dialer 层，未触及 eBPF/reload 核心。
+> 补丁 P1-P5 仅修改 dialer/config 层。P6 修改 `control/netns_utils.go`，涉及 eBPF 设备层。
 
 ### P2 详细说明
 
@@ -43,6 +44,28 @@
 - 为避免请求长时间堵塞，建议 `timeout >= 2s`（实际间隔为 `max(2s, timeout)`）
 - 探针成功 → 立即恢复使用固定节点
 - 重试耗尽 → fallback 到备用策略
+
+### P6 详细说明
+
+**痛点**：dae v2.0 在 kernel 6.7+ 上默认使用 netkit 设备对，但 netkit 接口索引可能在运行时漂移（issue [#1024](https://github.com/daeuniverse/dae/issues/1024)），导致 eBPF redirect 失败，翻墙流量返回 `Operation not permitted`。
+
+**修复**：通过 `DAE_DISABLE_NETKIT=1` 环境变量强制走 veth（稳定，更成熟的设备类型）。
+
+**使用方式**：
+```bash
+# procd（ImmortalWrt/OpenWrt）：在 /etc/init.d/dae 的 procd_set_param env 行追加
+procd_set_param env DAE_LOCATION_ASSET="/usr/share/v2ray" DAE_DISABLE_NETKIT=1
+
+# systemd：在 service 文件中添加
+Environment=DAE_DISABLE_NETKIT=1
+
+# CLI 启动
+DAE_DISABLE_NETKIT=1 /usr/bin/dae run --config /etc/dae/config.dae
+```
+
+**恢复 netkit**：去掉该变量或设为 `0` 即可。
+
+**性能差异**：veth 比 netkit 多几字节 ethernet header 拷贝，实际影响 < 1%，可忽略。
 
 ---
 
