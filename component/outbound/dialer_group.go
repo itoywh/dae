@@ -762,7 +762,7 @@ func alternateNetworkType(networkType *dialer.NetworkType) *dialer.NetworkType {
 func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerSelectionPolicy, nt *dialer.NetworkType) {
 	defer g.fixedFallbackRunning.Store(false)
 
-	ticker := time.NewTicker(policy.FixedFallbackTimeout)
+	ticker := time.NewTicker(max(policy.FixedFallbackTimeout, 2*time.Second))
 	defer ticker.Stop()
 
 	for {

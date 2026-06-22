@@ -32,7 +32,7 @@
 
 **参数说明**：
 - `index`: 固定节点索引（从0开始，严格按 `node {}` 书写顺序）
-- `timeout`: 单次重试间隔（支持亚秒级，如 `500ms`）
+- `timeout`: 单次重试间隔（支持亚秒级，如 `500ms`；实际最小间隔 **2s**，防止探针风暴）
 - `retries`: 最大重试次数
   - `retries=0`: 节点 dead 后立即 fallback，不等待 timeout
   - `retries>0`: 后台 goroutine 按 timeout 间隔驱动重试探测
@@ -123,7 +123,7 @@ goroutine ticker 触发:
 
 **Parameters**:
 - `index`: Fixed node index (0-based, in `node {}` declaration order)
-- `timeout`: Retry interval (supports sub-second, e.g. `500ms`)
+- `timeout`: Retry interval (supports sub-second, e.g. `500ms`; effective minimum is **2s**, prevents probe storm)
 - `retries`: Max retry attempts
   - `retries=0`: Immediately fallback on dead, no timeout wait
   - `retries>0`: Background goroutine drives retry probes at `timeout` intervals
