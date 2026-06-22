@@ -124,9 +124,6 @@ type collection struct {
 	MovingAverage     time.Duration
 	LastProbe         DialerProbeObservationSnapshot
 	Alive             atomic.Bool
-	// DeadSince records when this collection transitioned to dead (unix nano).
-	// Zero value means alive or never set. Written under collectionFineMu.
-	DeadSince int64
 }
 
 func newCollection() *collection {
@@ -159,19 +156,6 @@ func (d *Dialer) mustGetCollection(typ *NetworkType) *collection {
 
 func (d *Dialer) MustGetAlive(typ *NetworkType) bool {
 	return d.mustGetCollection(typ).Alive.Load()
-}
-
-// GetDeadSince returns the unix nano timestamp when this collection transitioned
-// to dead, or 0 if the collection is alive or was never set dead.
-// This is used by fixed_fallback to compute how long the node has been dead
-// independently of when traffic starts flowing.
-func (d *Dialer) GetDeadSince(typ *NetworkType) int64 {
-	if d == nil || typ == nil {
-		return 0
-	}
-	d.collectionFineMu.RLock()
-	defer d.collectionFineMu.RUnlock()
-	return d.collections[typ.Index()].DeadSince
 }
 
 func (d *Dialer) SnapshotLastProbe(typ *NetworkType) DialerProbeObservationSnapshot {
@@ -1067,13 +1051,6 @@ func (d *Dialer) markUnavailableInternal(typ *NetworkType, force bool, isTraffic
 	}
 	wasAlive := collection.Alive.Load()
 	collection.Alive.Store(alive)
-	if wasAlive != alive {
-		if alive {
-			collection.DeadSince = 0
-		} else {
-			collection.DeadSince = time.Now().UnixNano()
-		}
-	}
 
 	update := collectionUpdate{
 		alive:             alive,
@@ -1120,10 +1097,6 @@ func (d *Dialer) markAvailable(typ *NetworkType, latency time.Duration) (collect
 	avg, _ := collection.Latencies10.AvgLatency()
 	collection.MovingAverage = (collection.MovingAverage + latency) / 2
 	wasAlive := collection.Alive.Swap(true)
-	// Clear DeadSince on revival.
-	if !wasAlive {
-		collection.DeadSince = 0
-	}
 	update := collectionUpdate{
 		alive:             true,
 		movingAverage:     collection.MovingAverage,

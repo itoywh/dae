@@ -98,7 +98,7 @@ func NewDialerGroup(
 		fixed := dialers[p.FixedIndex]
 		if fixed != nil {
 			fixed.RegisterAliveTransitionCallback(func(nt *dialer.NetworkType, alive bool) {
-				if alive || nt.L4Proto != consts.L4ProtoStr_TCP {
+				if alive {
 					return
 				}
 				if group.fixedFallbackRunning.CompareAndSwap(false, true) {
