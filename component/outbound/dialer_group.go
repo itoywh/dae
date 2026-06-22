@@ -762,7 +762,18 @@ func alternateNetworkType(networkType *dialer.NetworkType) *dialer.NetworkType {
 func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerSelectionPolicy, nt *dialer.NetworkType) {
 	defer g.fixedFallbackRunning.Store(false)
 
-	ticker := time.NewTicker(max(policy.FixedFallbackTimeout, 2*time.Second))
+	actualTimeout := policy.FixedFallbackTimeout
+	if actualTimeout < 2*time.Second {
+		actualTimeout = 2 * time.Second
+		g.log.WithFields(logrus.Fields{
+			"group":        g.Name,
+			"configured":   policy.FixedFallbackTimeout.String(),
+			"actual":       actualTimeout.String(),
+			"node":         fixed.Property().Name,
+			"network_type": nt.String(),
+		}).Warnln("fixed_fallback timeout too low, clamped to minimum 2s to prevent probe storm")
+	}
+	ticker := time.NewTicker(actualTimeout)
 	defer ticker.Stop()
 
 	for {
