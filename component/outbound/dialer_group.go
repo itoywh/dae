@@ -98,7 +98,7 @@ func NewDialerGroup(
 		fixed := dialers[p.FixedIndex]
 		if fixed != nil {
 			fixed.RegisterAliveTransitionCallback(func(nt *dialer.NetworkType, alive bool) {
-				if alive {
+				if alive || nt.L4Proto != consts.L4ProtoStr_TCP {
 					return
 				}
 				if group.fixedFallbackRunning.CompareAndSwap(false, true) {
@@ -493,7 +493,10 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			var (
 				nowNano       int64
 				deadSinceNano int64
+				maxRetries    int64
 			)
+
+			maxRetries = int64(policy.FixedFallbackRetries)
 
 			g.fixedFallbackMu.Lock()
 			nowNano = time.Now().UnixNano()
@@ -513,9 +516,13 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 					go g.runFixedFallbackRetry(fixed, policy, nt)
 				}
 
-				// Background goroutine handles retries separately.
-				// Natural traffic falls back immediately.
-				goto doFallback
+				if maxRetries <= 0 {
+					goto doFallback
+				}
+
+				// First timeout window: keep using fixed node.
+				selected := preferAlternateSelectionNetworkType(fixed, nt)
+				return fixed, 0, selected, nil
 			}
 
 			// Node already known dead. Background goroutine owns retries.
@@ -744,7 +751,7 @@ func alternateNetworkType(networkType *dialer.NetworkType) *dialer.NetworkType {
 func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerSelectionPolicy, nt *dialer.NetworkType) {
 	defer g.fixedFallbackRunning.Store(false)
 
-	ticker := time.NewTicker(max(policy.FixedFallbackTimeout, 2*time.Second))
+	ticker := time.NewTicker(policy.FixedFallbackTimeout)
 	defer ticker.Stop()
 
 	for {
