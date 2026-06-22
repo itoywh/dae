@@ -40,22 +40,20 @@ type DialerGroup struct {
 	resuscitateLastTime atomic.Int64
 	noAliveLogLastTimes [8]atomic.Int64
 
-	// udp_check_dns configured flag
-	hasUdpDnsCheck bool
-
 	// fixed_fallback retry state (protected by fixedFallbackMu)
 	fixedFallbackMu            sync.Mutex
 	fixedFallbackDeadSince     int64
 	fixedFallbackRetryCount    int64
 	fixedFallbackLastRetryNano int64
-	fixedFallbackDone          bool
 	// Background retry goroutine for fixed_fallback.
 	// Started when the fixed node is first detected dead.
 	// Stopped when the node recovers (MustGetAlive=true).
+	fixedFallbackStopCh  chan struct{}
 	fixedFallbackRunning atomic.Bool
 
 	// fixed_fallback log rate limit
 	fixedFallbackLastLogMark atomic.Int64
+	fixedFallbackLastLogTime atomic.Int64
 
 	cachedMinCheckInterval time.Duration
 }
@@ -86,15 +84,7 @@ func NewDialerGroup(
 		dialersAnnotations:  dialersAnnotations,
 		checkTolerance:      option.CheckTolerance,
 		aliveChangeCallback: aliveChangeCallback,
-		hasUdpDnsCheck:      len(option.CheckDnsOptionRaw.Raw) > 0,
 	}
-
-	if !group.hasUdpDnsCheck && log != nil {
-		log.WithFields(logrus.Fields{
-			"group": name,
-		}).Infoln("udp_check_dns not configured, DNS UDP status follows TCP")
-	}
-
 	state := group.buildSelectionState(p, true)
 	group.registerAliveDialerSets(state.aliveDialerSets)
 	group.selectionState.Store(state)
@@ -112,7 +102,8 @@ func NewDialerGroup(
 					return
 				}
 				if group.fixedFallbackRunning.CompareAndSwap(false, true) {
-				group.fixedFallbackMu.Lock()
+					group.fixedFallbackStopCh = make(chan struct{})
+					group.fixedFallbackMu.Lock()
 					group.fixedFallbackDeadSince = time.Now().UnixNano()
 					group.fixedFallbackRetryCount = 0
 					group.fixedFallbackMu.Unlock()
@@ -123,9 +114,6 @@ func NewDialerGroup(
 	}
 
 	for _, nt := range standardSelectionNetworkTypes() {
-		if nt.L4Proto == consts.L4ProtoStr_UDP && nt.IsDnsSemantic() && !group.hasUdpDnsCheck {
-			continue
-		}
 		aliveChangeCallback(true, nt, true)
 	}
 
@@ -396,28 +384,6 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 	}
 }
 
-// logFixedFallbackDetail logs the actual fallback target after selection.
-func (g *DialerGroup) logFixedFallbackDetail(fixed, fallbackDialer *dialer.Dialer, nt *dialer.NetworkType, latency time.Duration) {
-	if g.log == nil {
-		return
-	}
-	fixedName := ""
-	if fixed != nil && fixed.Property() != nil {
-		fixedName = fixed.Property().Name
-	}
-	fallbackName := ""
-	if fallbackDialer != nil && fallbackDialer.Property() != nil {
-		fallbackName = fallbackDialer.Property().Name
-	}
-	g.log.WithFields(logrus.Fields{
-		"group":    g.Name,
-		"fixed":    fixedName,
-		"fallback": fallbackName,
-		"network":  nt.String(),
-		"latency":  latency.String(),
-	}).Warnln("Fixed dialer DEAD, fallback to", fallbackName)
-}
-
 // Select is a backward-compatible wrapper for SelectWithExclusion.
 func (g *DialerGroup) Select(networkType *dialer.NetworkType, strictIpVersion bool) (d *dialer.Dialer, latency time.Duration, err error) {
 	d, latency, _, err = g.SelectWithExclusionResult(networkType, strictIpVersion, nil)
@@ -514,8 +480,6 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				wasDead := g.fixedFallbackDeadSince != 0
 				g.fixedFallbackDeadSince = 0
 				g.fixedFallbackRetryCount = 0
-				g.fixedFallbackLastRetryNano = 0
-				g.fixedFallbackDone = false
 				g.fixedFallbackMu.Unlock()
 				if wasDead {
 					g.logFixedFallback(0, fixed, nt)
@@ -534,27 +498,19 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			g.fixedFallbackMu.Lock()
 			nowNano = time.Now().UnixNano()
 			deadSinceNano = g.fixedFallbackDeadSince
-			done := g.fixedFallbackDone
-
-			if done {
-				// Retries exhausted by background goroutine.
-				// Fallback until health check recovers the node.
-				g.fixedFallbackMu.Unlock()
-				g.logFixedFallback(-1, fixed, nt)
-				goto doFallback
-			}
 
 			if deadSinceNano == 0 {
 				// First Select() finding this node dead.
+				// Start background retry goroutine if not already running
+				// (may have been started by aliveTransitionCallback already).
 				g.fixedFallbackDeadSince = nowNano
 				g.fixedFallbackRetryCount = 0
 				g.fixedFallbackMu.Unlock()
 				g.logFixedFallback(1, fixed, nt)
 
-				// Start background retry goroutine if not already running
-				// (may have been started by aliveTransitionCallback already).
 				if g.fixedFallbackRunning.CompareAndSwap(false, true) {
-				go g.runFixedFallbackRetry(fixed, policy, nt)
+					g.fixedFallbackStopCh = make(chan struct{})
+					go g.runFixedFallbackRetry(fixed, policy, nt)
 				}
 
 				// Background goroutine handles retries separately.
@@ -573,7 +529,6 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			case consts.DialerSelectionPolicy_Random:
 				d := a.GetRandExcluded(excluded)
 				if d != nil {
-					g.logFixedFallbackDetail(fixed, d, nt, 0)
 					selected := preferAlternateSelectionNetworkType(d, nt)
 					return d, 0, selected, nil
 				}
@@ -582,7 +537,6 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				consts.DialerSelectionPolicy_MinMovingAverageLatencies:
 				d, lat := a.GetMinLatency(excluded)
 				if d != nil {
-					g.logFixedFallbackDetail(fixed, d, nt, lat)
 					selected := preferAlternateSelectionNetworkType(d, nt)
 					return d, lat, selected, nil
 				}
@@ -667,13 +621,6 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 
 	for i, nt := range specs {
 		networkType := *nt
-
-		// Skip DNS UDP types when udp_check_dns is not configured.
-		// Their AliveDialerSet slots will be aliased to TCP below.
-		if networkType.L4Proto == consts.L4ProtoStr_UDP && networkType.IsDnsSemantic() && !g.hasUdpDnsCheck {
-			continue
-		}
-
 		set := dialer.NewAliveDialerSet(
 			g.log, g.Name, &networkType, g.checkTolerance, aliveSetPolicy,
 			g.Dialers, g.dialersAnnotations,
@@ -696,14 +643,6 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 			}
 		}
 	}
-
-	// When udp_check_dns is not configured, alias DNS UDP slots to TCP sets
-	// so routing lookups don't hit nil.
-	if !g.hasUdpDnsCheck {
-		state.aliveDialerSets[dialer.IdxDnsUdp4] = state.aliveDialerSets[dialer.IdxTcp4]
-		state.aliveDialerSets[dialer.IdxDnsUdp6] = state.aliveDialerSets[dialer.IdxTcp6]
-	}
-
 	return state
 }
 
@@ -798,33 +737,12 @@ func alternateNetworkType(networkType *dialer.NetworkType) *dialer.NetworkType {
 	}
 }
 
-// resetFixedFallback clears all fixed_fallback retry state.
-func (g *DialerGroup) resetFixedFallback() {
-	g.fixedFallbackMu.Lock()
-	g.fixedFallbackDeadSince = 0
-	g.fixedFallbackRetryCount = 0
-	g.fixedFallbackLastRetryNano = 0
-	g.fixedFallbackDone = false
-	g.fixedFallbackMu.Unlock()
-}
-
 // runFixedFallbackRetry is a background goroutine that drives the
 // timeout × retries cycle for the fixed_fallback policy independently
 // of traffic. It fires probes at each FixedFallbackTimeout interval,
 // and after maxRetries, marks the node for fallback.
 func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerSelectionPolicy, nt *dialer.NetworkType) {
 	defer g.fixedFallbackRunning.Store(false)
-
-	// retries <= 0: give up immediately, no ticker needed.
-	// Node stays marked as done until health check recovers it.
-	if policy.FixedFallbackRetries <= 0 {
-		g.fixedFallbackMu.Lock()
-		g.fixedFallbackDone = true
-		g.fixedFallbackDeadSince = time.Now().UnixNano() - 1
-		g.fixedFallbackMu.Unlock()
-		g.logFixedFallback(-1, fixed, nt)
-		return
-	}
 
 	actualTimeout := policy.FixedFallbackTimeout
 	if actualTimeout < 2*time.Second {
@@ -842,12 +760,17 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 
 	for {
 		select {
+		case <-g.fixedFallbackStopCh:
+			return
 		case <-ticker.C:
 		}
 
 		// Check if node has recovered
 		if fixed.MustGetAlive(nt) {
-			g.resetFixedFallback()
+			g.fixedFallbackMu.Lock()
+			g.fixedFallbackDeadSince = 0
+			g.fixedFallbackRetryCount = 0
+			g.fixedFallbackMu.Unlock()
 			return
 		}
 
@@ -856,13 +779,12 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 		g.fixedFallbackRetryCount++
 		g.fixedFallbackLastRetryNano = time.Now().UnixNano()
 
-		// Log retry before checking fallback, so user sees N retries for retries=N config.
-		g.logFixedFallback(10+g.fixedFallbackRetryCount, fixed, nt)
-
 		shouldFallback := g.fixedFallbackRetryCount >= int64(policy.FixedFallbackRetries)
 		if shouldFallback {
-			g.fixedFallbackDone = true
-			g.fixedFallbackDeadSince = time.Now().UnixNano() - 1
+			// Make deadSince far in the past so any Select() immediately
+			// sees elapsed >> timeout and falls back.
+			g.fixedFallbackDeadSince = time.Now().UnixNano() -
+				int64(policy.FixedFallbackTimeout)*int64(policy.FixedFallbackRetries) - 1
 		} else {
 			g.fixedFallbackDeadSince = time.Now().UnixNano()
 		}
@@ -874,20 +796,9 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 		fixed.NotifyCheckDnsUdp()
 
 		if shouldFallback {
-			// Goroutine exits here — traffic was already fallen back by Select().
-			// Log at INFO level since this only means retries are done, not a new fallback.
-			if g.log != nil {
-				nodeName := ""
-				if fixed != nil && fixed.Property() != nil {
-					nodeName = fixed.Property().Name
-				}
-				g.log.WithFields(logrus.Fields{
-					"group":   g.Name,
-					"dialer":  nodeName,
-					"network": nt.String(),
-				}).Infoln("Fixed dialer retry exhausted, probing paused")
-			}
+			g.logFixedFallback(-1, fixed, nt)
 			return
 		}
+		g.logFixedFallback(10+g.fixedFallbackRetryCount, fixed, nt)
 	}
 }
