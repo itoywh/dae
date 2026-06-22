@@ -494,45 +494,61 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 
 			maxRetries = int64(policy.FixedFallbackRetries)
 
+			// Read collection's DeadSince before the mutex (takes its own lock).
+			collectionDeadSince := fixed.GetDeadSince(nt)
+
 			g.fixedFallbackMu.Lock()
 			nowNano = time.Now().UnixNano()
 			deadSinceNano = g.fixedFallbackDeadSince
 			retryCount = g.fixedFallbackRetryCount
 
 			if deadSinceNano == 0 {
-				// Node is dead (MustGetAlive=false) but fixedFallbackDeadSince
-				// was never set. This happens when the health check / traffic
-				// failure path set collection.Alive=false but the DialerGroup's
-				// retry state was not notified.
-				//
-				// Since we don't know when the node actually died, and the
-				// health check has already confirmed it is unreachable, there
-				// is no point running the timeout × retries cycle now — the
-				// node's dead state is already authoritative.
-				//
-				// Skip retries and fallback immediately to the configured
-				// fallback policy (random / min_moving_avg / min).
-				// We intentionally do NOT set fixedFallbackDeadSince here so
-				// subsequent Select() calls within the same "dead" window
-				// also hit this path and fallback immediately, rather than
-				// waiting timeout × retries behind a stale timer.
+				// First Select() finding this node dead. Use the collection's
+				// DeadSince (set by health check) so the retry timer counts
+				// from the actual death time, not from first traffic.
+				if collectionDeadSince > 0 {
+					deadSinceNano = collectionDeadSince
+					g.fixedFallbackDeadSince = collectionDeadSince
+				} else {
+					deadSinceNano = nowNano
+					g.fixedFallbackDeadSince = nowNano
+				}
+				g.fixedFallbackRetryCount = 0
 				g.fixedFallbackMu.Unlock()
-				g.logFixedFallback(-1, fixed, nt)
-				goto doFallback
+				g.logFixedFallback(1, fixed, nt)
+
+				// If retries=0, fallback immediately without waiting.
+				if maxRetries <= 0 {
+					goto doFallback
+				}
+
+				// Fall through to elapsed check with the actual death timestamp.
+			} else {
+				g.fixedFallbackMu.Unlock()
 			}
 
 			elapsed = time.Duration(nowNano - deadSinceNano)
 			if elapsed < policy.FixedFallbackTimeout {
-				// Still within timeout window → keep using fixed node
-				g.fixedFallbackMu.Unlock()
+				// Within timeout window → keep using fixed node
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
 				return fixed, 0, selected, nil
+			}
+
+			// If the node has been dead longer than timeout × retries,
+			// all retries would have already expired. Skip to fallback.
+			if elapsed >= policy.FixedFallbackTimeout*time.Duration(maxRetries) {
+				g.fixedFallbackMu.Lock()
+				g.fixedFallbackRetryCount = maxRetries
+				g.fixedFallbackMu.Unlock()
+				g.logFixedFallback(-1, fixed, nt)
+				goto doFallback
 			}
 
 			// Timeout passed → dedup-protected retry count increment.
 			// Multiple networkTypes may trigger _select concurrently and
 			// share the same retry state; requiring FixedFallbackTimeout/2
 			// between increments prevents batch-advance of the counter.
+			g.fixedFallbackMu.Lock()
 			if nowNano-g.fixedFallbackLastRetryNano > int64(policy.FixedFallbackTimeout)/2 {
 				newRetryCount = retryCount + 1
 				g.fixedFallbackRetryCount = newRetryCount
