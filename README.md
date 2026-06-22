@@ -41,7 +41,7 @@ dae supports several dialer (node) selection policies for `group` blocks:
 | `fixed(index)` | Always use the node at the given index. No fallback |
 | `min_moving_avg` | Pick the node with the lowest moving-average latency |
 | `min_avg10` | Pick the node with the lowest average latency over the last 10 probes |
-| `min_last_latency` | Pick the node with the lowest most-recent latency |
+| `min` | Pick the node with the lowest most-recent latency |
 | `random` | Pick a random alive node |
 | **`fixed_fallback(index, timeout, retries, fallback_policy)`** | **Fixed node with disaster-recovery fallback** |
 
