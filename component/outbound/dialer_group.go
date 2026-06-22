@@ -511,10 +511,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			var (
 				nowNano       int64
 				deadSinceNano int64
-				maxRetries    int64
 			)
-
-			maxRetries = int64(policy.FixedFallbackRetries)
 
 			g.fixedFallbackMu.Lock()
 			nowNano = time.Now().UnixNano()
@@ -534,13 +531,9 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 					go g.runFixedFallbackRetry(fixed, policy, nt)
 				}
 
-				if maxRetries <= 0 {
-					goto doFallback
-				}
-
-				// First timeout window: keep using fixed node.
-				selected := preferAlternateSelectionNetworkType(fixed, nt)
-				return fixed, 0, selected, nil
+				// Background goroutine handles retries separately.
+				// Natural traffic falls back immediately.
+				goto doFallback
 			}
 
 			// Node already known dead. Background goroutine owns retries.
