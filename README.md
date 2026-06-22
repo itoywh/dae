@@ -26,24 +26,180 @@
 
 > 补丁 P1-P5 仅修改 dialer/config 层。P6 修改 `control/netns_utils.go`，涉及 eBPF 设备层。
 
-### P2 详细说明
+### P2 FixedWithFallback 详细说明
 
-**FixedWithFallback 策略语法**：`fixed_fallback(index, timeout, retries, fallback_policy)`
+**策略语法**：`fixed_fallback(index, timeout, retries, fallback_policy)`
 
 **参数说明**：
-- `index`: 固定节点索引
-- `timeout`: 超时时间（支持亚秒级，如 `500ms`）
-- `retries`: 重试次数
+- `index`: 固定节点索引（从0开始，严格按 `node {}` 书写顺序）
+- `timeout`: 单次重试间隔（支持亚秒级，如 `500ms`）
+- `retries`: 最大重试次数
   - `retries=0`: 节点 dead 后立即 fallback，不等待 timeout
-  - `retries>0`: 每次 timeout 后发送紧急探针检测，最多重试 retries 次
-- `fallback_policy`: 备用策略（`random`、`min_last_latency` 等）
+  - `retries>0`: 后台 goroutine 按 timeout 间隔驱动重试探测
+- `fallback_policy`: 备用选择策略（`random`、`min_last_latency`、`min_moving_avg_latency` 等）
 
-**紧急探针机制**：
-- 节点 dead 后，每次 timeout 到达时主动发送 TCP/UDP 探针检测是否恢复
-- 探针最小间隔 **2s**（cooldown），防止探针风暴保护系统资源
-- 为避免请求长时间堵塞，建议 `timeout >= 2s`（实际间隔为 `max(2s, timeout)`）
-- 探针成功 → 立即恢复使用固定节点
-- 重试耗尽 → fallback 到备用策略
+#### 工作原理
+
+```
+                    ┌─ MustGetAlive=true  ── 正常返回固定节点 (s4)
+                    │
+  Select() ─────────┤                                   自然流量
+                    │                                     ↓
+                    └─ MustGetAlive=false ── → goto doFallback → 备份节点 (s2/s5)
+                                               │
+                                               ├─ 启动后台 goroutine
+                                               │     │
+                                               │     ├─ ticker 每 timeout ─┬─ 探测成功 → deadSince=0 → 流量切回固定节点
+                                               │     │                      └─ 失败 → retryCount++
+                                               │     │                                   └─ ≥retries → 永久 fallback
+                                               │     │
+                                               │     └─ 发送 NotifyCheckTcp/Udp 探针触发健康检查
+                                               │
+                                               └─ 后续 Select() → deadSince≠0 → goto doFallback
+```
+
+#### 核心设计：两层分离
+
+| 层 | 职责 | 是否向死节点发流量 |
+|----|------|------------------|
+| **自然流量**（`Select()`） | MustGetAlive=false 立刻 fallback；MustGetAlive=true 立刻切回 | ❌ 从不（从第一个字节开始就走备份） |
+| **后台 goroutine** | 独立 ticker 驱动重试；发送探针检测固定节点是否恢复 | ✅ 探针专用（仅发健康检查请求） |
+
+#### 四个关键事件流
+
+**① 节点从活→死**
+```
+健康检查探测失败 → Alive=false
+  ├─ [路径A] aliveTransitionCallback → CompareAndSwap(false→true) → 启动 goroutine
+  └─ [路径B] 自然流量 Select() 发现 MustGetAlive=false
+       └─ deadSince==0 → 记录时间 → 若 goroutine 未启动则启动之 → goto doFallback
+```
+
+**② 死亡期间的自然流量**
+```
+Select() → MustGetAlive=false → deadSince≠0 → goto doFallback → 返回 s2/s5
+```
+所有自然流量绕过死节点，**不参与重试计数**。
+
+**③ 后台重试探测**
+```
+goroutine ticker 触发:
+  └─ MustGetAlive? ─┬─ true  → deadSince=0 → return（goroutine 退出）
+                      └─ false → retryCount++
+                           ├─ retryCount < retries → 等待下一个 tick
+                           └─ retryCount ≥ retries → 标记永久 fallback → return
+```
+`NotifyCheckTcp()` 和 `NotifyCheckDnsUdp()` 在每个 tick 发送探针。
+
+**④ 节点从死→活**
+```
+恢复探测触发（健康检查或 goroutine 探针）→ MustGetAlive=true
+  ├─ goroutine 检测到 → deadSince=0, retryCount=0 → return
+  └─ 自然流量 Select() 检测到 → deadSince=0, retryCount=0 → 返回固定节点
+```
+**切回零延迟**：恢复发生在健康检查周期内（如 `check_interval=10s` 最多等 10s），与 goroutine 的 ticker 无关。
+
+#### 零延迟切换对比
+
+| 方案 | 死了→fallback | 活了→切回 | 死节点流量 |
+|------|-------------|----------|----------|
+| SSR-Plus | 60s 循环检测后 | 每循环检测主力 | 60s |
+| PassWall 2 | 1min burstObservatory | 3次均值判定 | 1-3min |
+| **dae（本补丁）** | **第一次流量即 fallback** | **健康检查周期内恢复** | **0（零自然流量浪费）** |
+
+#### 关键实现细节
+
+- **aliveTransitionCallback**：健康检查（connectivity_check）标记 TCP dead 时自动启动 goroutine，不依赖自然流量触发
+- **deadSince 时间戳**：`fixedFallbackDeadSince` 记录首次发现死亡的时刻，用于区分首次 vs 后续 Select()
+- **CompareAndSwap**：保证仅一个 goroutine 在运行，`fixedFallbackStopCh` 用于 goroutine 退出时信号传递
+- **探针 cooldown**：由 `timeout` 参数决定，内置间隔 >= 2s（当 timeout < 2s 时自动抬升到 2s），防止探针风暴
+- **恢复后清除状态**：`MustGetAlive=true` 同时清除 `deadSince` 和 `retryCount`，确保状态干净
+- **支持 UDP-only 检测**：不限于 TCP 类型的健康检查，UDP/DNS-UDP/Data-UDP 的 dead transition 同样触发 goroutine
+
+<details>
+<summary><b>P2 FixedWithFallback — English</b></summary>
+
+**Syntax**: `fixed_fallback(index, timeout, retries, fallback_policy)`
+
+**Parameters**:
+- `index`: Fixed node index (0-based, in `node {}` declaration order)
+- `timeout`: Retry interval (supports sub-second, e.g. `500ms`)
+- `retries`: Max retry attempts
+  - `retries=0`: Immediately fallback on dead, no timeout wait
+  - `retries>0`: Background goroutine drives retry probes at `timeout` intervals
+- `fallback_policy`: Fallback selection (`random`, `min_last_latency`, `min_moving_avg_latency`, etc.)
+
+#### How It Works
+
+```
+                  ┌─ MustGetAlive=true  ── Return fixed node (s4) normally
+                  │
+  Select() ───────┤                                    Natural Traffic
+                  │                                       ↓
+                  └─ MustGetAlive=false ── → goto doFallback → Backup (s2/s5)
+                                             │
+                                             ├─ Start background goroutine
+                                             │     │
+                                             │     ├─ ticker every timeout ─┬─ Probe OK → deadSince=0 → traffic back to fixed
+                                             │     │                         └─ Fail → retryCount++
+                                             │     │                                      └─ ≥retries → permanent fallback
+                                             │     │
+                                             │     └─ Send NotifyCheckTcp/Udp probes
+                                             │
+                                             └─ Subsequent Select() → deadSince≠0 → goto doFallback
+```
+
+#### Two-Layer Architecture
+
+| Layer | Responsibility | Sends traffic to dead node? |
+|-------|---------------|---------------------------|
+| **Natural Traffic** (`Select()`) | Fallback immediately on dead; switch back immediately on alive | ❌ Never (first byte goes to backup) |
+| **Background Goroutine** | Independent ticker-driven retry cycle; probes fixed node for recovery | ✅ Probe-only (health check requests) |
+
+#### Four Key Event Flows
+
+**① Node Go Dead**
+```
+Health check fails → Alive=false
+  ├─ [Path A] aliveTransitionCallback → CompareAndSwap(false→true) → start goroutine
+  └─ [Path B] Select() finds MustGetAlive=false
+       └─ deadSince==0 → record timestamp → start goroutine if not running → goto doFallback
+```
+
+**② Natural Traffic During Death**
+```
+Select() → MustGetAlive=false → deadSince≠0 → goto doFallback → return s2/s5
+```
+Zero traffic wasted on dead node. **Natural traffic does NOT participate in retry counting.**
+
+**③ Background Retry Probing**
+```
+Goroutine ticker fires:
+  └─ MustGetAlive? ─┬─ true  → deadSince=0 → return (goroutine exits)
+                      └─ false → retryCount++
+                           ├─ retryCount < retries → wait next tick
+                           └─ retryCount ≥ retries → permanent fallback → return
+```
+`NotifyCheckTcp()` and `NotifyCheckDnsUdp()` are fired each tick.
+
+**④ Node Revive**
+```
+Health check or goroutine probe detects recovery → MustGetAlive=true
+  ├─ Goroutine path → deadSince=0, retryCount=0 → return
+  └─ Select() path → deadSince=0, retryCount=0 → return fixed node
+```
+**Zero-latency switch back**: recovery happens within the health check cycle (e.g. `check_interval=10s`), independent of goroutine ticker.
+
+#### Key Implementation Details
+
+- **aliveTransitionCallback**: Health check (`connectivity_check`) on TCP dead transition automatically starts the goroutine — no traffic required
+- **deadSince Timestamp**: `fixedFallbackDeadSince` records when death was first observed, distinguishing first vs subsequent Select()
+- **CompareAndSwap**: Ensures exactly one goroutine runs; `fixedFallbackStopCh` signals goroutine exit
+- **Probe Cooldown**: Governed by `timeout` parameter (minimum 2s in effect), prevents probe storm
+- **State Cleanup on Revive**: `MustGetAlive=true` clears both `deadSince` and `retryCount`
+- **UDP-only Support**: Not limited to TCP health checks — UDP/DNS-UDP/Data-UDP dead transitions also trigger the goroutine
+
+</details>
 
 ### P6 详细说明
 
