@@ -90,6 +90,29 @@ func NewDialerGroup(
 	group.selectionState.Store(state)
 	group.cachedMinCheckInterval = group.MinCheckInterval()
 
+	// Register a callback on the fixed dialer so the background retry
+	// goroutine starts when the health check marks the node as dead,
+	// not only when traffic flows through Select().
+	if p.Policy == consts.DialerSelectionPolicy_FixedWithFallback &&
+		p.FixedIndex >= 0 && p.FixedIndex < len(dialers) {
+		fixed := dialers[p.FixedIndex]
+		if fixed != nil {
+			fixed.RegisterAliveTransitionCallback(func(nt *dialer.NetworkType, alive bool) {
+				if alive || nt.L4Proto != consts.L4ProtoStr_TCP {
+					return
+				}
+				if group.fixedFallbackRunning.CompareAndSwap(false, true) {
+					group.fixedFallbackStopCh = make(chan struct{})
+					group.fixedFallbackMu.Lock()
+					group.fixedFallbackDeadSince = time.Now().UnixNano()
+					group.fixedFallbackRetryCount = 0
+					group.fixedFallbackMu.Unlock()
+					go group.runFixedFallbackRetry(fixed, p, nt)
+				}
+			})
+		}
+	}
+
 	for _, nt := range standardSelectionNetworkTypes() {
 		aliveChangeCallback(true, nt, true)
 	}
@@ -499,7 +522,8 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 
 			if deadSinceNano == 0 {
 				// First Select() finding this node dead.
-				// Start the background retry goroutine.
+				// Start background retry goroutine if not already running
+				// (may have been started by aliveTransitionCallback already).
 				g.fixedFallbackDeadSince = nowNano
 				g.fixedFallbackRetryCount = 0
 				g.fixedFallbackMu.Unlock()
