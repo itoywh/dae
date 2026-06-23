@@ -797,6 +797,9 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 		g.fixedFallbackRetryCount++
 		g.fixedFallbackLastRetryNano = time.Now().UnixNano()
 
+		// Log retry before checking fallback, so user sees N retries for retries=N config.
+		g.logFixedFallback(10+g.fixedFallbackRetryCount, fixed, nt)
+
 		shouldFallback := g.fixedFallbackRetryCount >= int64(policy.FixedFallbackRetries)
 		if shouldFallback {
 			// Make deadSince far in the past so any Select() immediately
@@ -817,6 +820,5 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 			g.logFixedFallback(-1, fixed, nt)
 			return
 		}
-		g.logFixedFallback(10+g.fixedFallbackRetryCount, fixed, nt)
 	}
 }
