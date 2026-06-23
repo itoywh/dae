@@ -817,7 +817,19 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 		fixed.NotifyCheckDnsUdp()
 
 		if shouldFallback {
-			g.logFixedFallback(-1, fixed, nt)
+			// Goroutine exits here — traffic was already fallen back by Select().
+			// Log at INFO level since this only means retries are done, not a new fallback.
+			if g.log != nil {
+				nodeName := ""
+				if fixed != nil && fixed.Property() != nil {
+					nodeName = fixed.Property().Name
+				}
+				g.log.WithFields(logrus.Fields{
+					"group":   g.Name,
+					"dialer":  nodeName,
+					"network": nt.String(),
+				}).Infoln("Fixed dialer retry exhausted, probing paused")
+			}
 			return
 		}
 	}
