@@ -40,6 +40,9 @@ type DialerGroup struct {
 	resuscitateLastTime atomic.Int64
 	noAliveLogLastTimes [8]atomic.Int64
 
+	// udp_check_dns configured flag
+	hasUdpDnsCheck bool
+
 	// fixed_fallback retry state (protected by fixedFallbackMu)
 	fixedFallbackMu            sync.Mutex
 	fixedFallbackDeadSince     int64
@@ -83,7 +86,15 @@ func NewDialerGroup(
 		dialersAnnotations:  dialersAnnotations,
 		checkTolerance:      option.CheckTolerance,
 		aliveChangeCallback: aliveChangeCallback,
+		hasUdpDnsCheck:      len(option.CheckDnsOptionRaw.Raw) > 0,
 	}
+
+	if !group.hasUdpDnsCheck && log != nil {
+		log.WithFields(logrus.Fields{
+			"group": name,
+		}).Infoln("udp_check_dns not configured, DNS UDP status follows TCP")
+	}
+
 	state := group.buildSelectionState(p, true)
 	group.registerAliveDialerSets(state.aliveDialerSets)
 	group.selectionState.Store(state)
@@ -112,6 +123,9 @@ func NewDialerGroup(
 	}
 
 	for _, nt := range standardSelectionNetworkTypes() {
+		if nt.L4Proto == consts.L4ProtoStr_UDP && nt.IsDnsSemantic() && !group.hasUdpDnsCheck {
+			continue
+		}
 		aliveChangeCallback(true, nt, true)
 	}
 
@@ -400,6 +414,28 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 	}
 }
 
+// logFixedFallbackDetail logs the actual fallback target after selection.
+func (g *DialerGroup) logFixedFallbackDetail(fixed, fallbackDialer *dialer.Dialer, nt *dialer.NetworkType, latency time.Duration) {
+	if g.log == nil {
+		return
+	}
+	fixedName := ""
+	if fixed != nil && fixed.Property() != nil {
+		fixedName = fixed.Property().Name
+	}
+	fallbackName := ""
+	if fallbackDialer != nil && fallbackDialer.Property() != nil {
+		fallbackName = fallbackDialer.Property().Name
+	}
+	g.log.WithFields(logrus.Fields{
+		"group":    g.Name,
+		"fixed":    fixedName,
+		"fallback": fallbackName,
+		"network":  nt.String(),
+		"latency":  latency.String(),
+	}).Warnln("Fixed dialer DEAD, fallback to", fallbackName)
+}
+
 // Select is a backward-compatible wrapper for SelectWithExclusion.
 func (g *DialerGroup) Select(networkType *dialer.NetworkType, strictIpVersion bool) (d *dialer.Dialer, latency time.Duration, err error) {
 	d, latency, _, err = g.SelectWithExclusionResult(networkType, strictIpVersion, nil)
@@ -555,6 +591,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			case consts.DialerSelectionPolicy_Random:
 				d := a.GetRandExcluded(excluded)
 				if d != nil {
+					g.logFixedFallbackDetail(fixed, d, nt, 0)
 					selected := preferAlternateSelectionNetworkType(d, nt)
 					return d, 0, selected, nil
 				}
@@ -563,6 +600,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				consts.DialerSelectionPolicy_MinMovingAverageLatencies:
 				d, lat := a.GetMinLatency(excluded)
 				if d != nil {
+					g.logFixedFallbackDetail(fixed, d, nt, lat)
 					selected := preferAlternateSelectionNetworkType(d, nt)
 					return d, lat, selected, nil
 				}
@@ -647,6 +685,13 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 
 	for i, nt := range specs {
 		networkType := *nt
+
+		// Skip DNS UDP types when udp_check_dns is not configured.
+		// Their AliveDialerSet slots will be aliased to TCP below.
+		if networkType.L4Proto == consts.L4ProtoStr_UDP && networkType.IsDnsSemantic() && !g.hasUdpDnsCheck {
+			continue
+		}
+
 		set := dialer.NewAliveDialerSet(
 			g.log, g.Name, &networkType, g.checkTolerance, aliveSetPolicy,
 			g.Dialers, g.dialersAnnotations,
@@ -669,6 +714,14 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 			}
 		}
 	}
+
+	// When udp_check_dns is not configured, alias DNS UDP slots to TCP sets
+	// so routing lookups don't hit nil.
+	if !g.hasUdpDnsCheck {
+		state.aliveDialerSets[dialer.IdxDnsUdp4] = state.aliveDialerSets[dialer.IdxTcp4]
+		state.aliveDialerSets[dialer.IdxDnsUdp6] = state.aliveDialerSets[dialer.IdxTcp6]
+	}
+
 	return state
 }
 
