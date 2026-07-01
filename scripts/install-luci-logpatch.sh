@@ -1,6 +1,6 @@
 #!/bin/sh
-# luci-app-dae 日志页增强安装脚本
-# 添加"清除日志"按钮，修复滚动按钮（使用 scrollIntoView 替代 window.scrollTo）
+# luci-app-dae 日志页增强安装脚本 - 仅添加"清除日志"按钮
+# 滚动按钮保持上游原始代码不变
 # 用法: curl -sL https://raw.githubusercontent.com/itoywh/dae/v2.0-custom/scripts/install-luci-logpatch.sh | sh
 
 set -e
@@ -29,10 +29,10 @@ cat > /www/luci-static/resources/view/dae/log.js << 'LOGFILE'
    }     \
    .description {    \
     background-color: #33ccff; \
-   }';let log_textarea=E('div',{'id':'log_textarea'},E('img',{'src':L.resource('icons/loading.svg'),'alt':_('Loading...'),'style':'vertical-align:middle'},_('Collecting data…')));let logRefresh=function(){return fs.read_direct('/var/log/dae/dae.log','text').then(function(content){let log=E('pre',{'wrap':'pre'},[content.trim()||_('Log is empty.')]);dom.content(log_textarea,log);}).catch(function(e){let log;if(e.toString().includes('NotFoundError'))log=E('pre',{'wrap':'pre'},[_('Log file does not exist.')]);else log=E('pre',{'wrap':'pre'},[_('Unknown error: %s').format(e)]);dom.content(log_textarea,log);});};poll.add(L.bind(logRefresh));const scrollDownButton=E('button',{'id':'scrollDownButton','class':'cbi-button cbi-button-neutral',},_('Scroll to tail','scroll to bottom (the tail) of the log file'));scrollDownButton.addEventListener('click',function(){scrollUpButton.scrollIntoView();scrollDownButton.blur();});const clearLogButton=E('button',{'id':'clearLogButton','class':'cbi-button cbi-button-negative','style':'margin-left:8px',},'清除日志');clearLogButton.addEventListener('click',function(){fs.write('/var/log/dae/dae.log','').then(logRefresh).catch(function(e){console.error('Failed to clear log:',e);});});const scrollUpButton=E('button',{'id':'scrollUpButton','class':'cbi-button cbi-button-neutral',},_('Scroll to head','scroll to top (the head) of the log file'));scrollUpButton.addEventListener('click',function(){scrollDownButton.scrollIntoView();scrollUpButton.blur();});return E([E('style',[css]),E('h2',{},[_('Log')]),E('div',{'class':'cbi-map'},[E('div',{'style':'padding-bottom:20px'},[scrollDownButton,clearLogButton]),E('div',{'class':'cbi-section'},[log_textarea,E('div',{'style':'text-align:right'},E('small',{},_('Refresh every %s seconds.').format(L.env.pollinterval)))]),E('div',{'style':'padding-bottom:20px'},[scrollUpButton])])]);},handleSaveApply:null,handleSave:null,handleReset:null});
+   }';let log_textarea=E('div',{'id':'log_textarea'},E('img',{'src':L.resource('icons/loading.svg'),'alt':_('Loading...'),'style':'vertical-align:middle'},_('Collecting data…')));let logRefresh=function(){return fs.read_direct('/var/log/dae/dae.log','text').then(function(content){let log=E('pre',{'wrap':'pre'},[content.trim()||_('Log is empty.')]);dom.content(log_textarea,log);}).catch(function(e){let log;if(e.toString().includes('NotFoundError'))log=E('pre',{'wrap':'pre'},[_('Log file does not exist.')]);else log=E('pre',{'wrap':'pre'},[_('Unknown error: %s').format(e)]);dom.content(log_textarea,log);});};poll.add(L.bind(logRefresh));const scrollDownButton=E('button',{'id':'scrollDownButton','class':'cbi-button cbi-button-neutral',},_('Scroll to tail','scroll to bottom (the tail) of the log file'));scrollDownButton.addEventListener('click',()=>{scrollUpButton.scrollIntoView();scrollDownButton.blur();});const clearLogButton=E('button',{'id':'clearLogButton','class':'cbi-button cbi-button-negative','style':'margin-left:8px',},'清除日志');clearLogButton.addEventListener('click',function(){fs.write('/var/log/dae/dae.log','').then(logRefresh).catch(function(e){console.error('Failed to clear log:',e);});});const scrollUpButton=E('button',{'id':'scrollUpButton','class':'cbi-button cbi-button-neutral',},_('Scroll to head','scroll to top (the head) of the log file'));scrollUpButton.addEventListener('click',()=>{scrollDownButton.scrollIntoView();scrollUpButton.blur();});return E([E('style',[css]),E('h2',{},[_('Log')]),E('div',{'class':'cbi-map'},[E('div',{'style':'padding-bottom:20px'},[scrollDownButton,clearLogButton]),E('div',{'class':'cbi-section'},[log_textarea,E('div',{'style':'text-align:right'},E('small',{},_('Refresh every %s seconds.').format(L.env.pollinterval)))]),E('div',{'style':'padding-bottom:20px'},[scrollUpButton])])]);},handleSaveApply:null,handleSave:null,handleReset:null});
 LOGFILE
 
-# 写入 ACL 权限文件
+# 写入 ACL 权限文件（添加 log 文件写权限）
 cat > /usr/share/rpcd/acl.d/luci-app-dae.json << 'ACLFILE'
 {
 	"luci-app-dae": {
@@ -66,7 +66,7 @@ ACLFILE
 echo ""
 echo "✅ 安装完成！"
 echo "   - 日志页面已添加「清除日志」按钮（红色）"
-echo "   - 滚动按钮已修复（scrollIntoView 滚动到对应位置）"
+echo "   - 滚动按钮保持上游原始代码不变"
 echo "   - ACL 权限已更新（日志文件可写）"
 echo ""
 echo "请刷新 LuCI 页面 (Ctrl+Shift+R) 刷浏览器缓存"
