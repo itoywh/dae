@@ -48,6 +48,7 @@ type DialerGroup struct {
 	// fixed_fallback log rate limit
 	fixedFallbackLastLogMark atomic.Int64 // 0=alive, 1=dead_detected, 2+=retry_step, -1=fallen_back
 	fixedFallbackLastLogTime atomic.Int64
+	fixedFallbackDetailLog   atomic.Int64 // nanosecond timestamp for 10s rate limit
 
 	cachedMinCheckInterval time.Duration
 }
@@ -453,9 +454,42 @@ func (g *DialerGroup) FixedDialerFailed(d *dialer.Dialer, networkType *dialer.Ne
 	return false
 }
 
+// logFixedFallbackDetail logs the actual fallback target after selection.
+// Rate-limited to once per 10 seconds to prevent log spam under high traffic.
+func (g *DialerGroup) logFixedFallbackDetail(fixed, fallbackDialer *dialer.Dialer, nt *dialer.NetworkType, latency time.Duration) {
+	if g.log == nil {
+		return
+	}
+	// Rate limit: allow one log per 10 seconds.
+	now := time.Now().UnixNano()
+	last := g.fixedFallbackDetailLog.Load()
+	if now-last < 10*int64(time.Second) {
+		return
+	}
+	if !g.fixedFallbackDetailLog.CompareAndSwap(last, now) {
+		return
+	}
+	fixedName := ""
+	if fixed != nil && fixed.Property() != nil {
+		fixedName = fixed.Property().Name
+	}
+	fallbackName := ""
+	if fallbackDialer != nil && fallbackDialer.Property() != nil {
+		fallbackName = fallbackDialer.Property().Name
+	}
+	g.log.WithFields(logrus.Fields{
+		"group":    g.Name,
+		"fixed":    fixedName,
+		"fallback": fallbackName,
+		"network":  nt.String(),
+		"latency":  latency.String(),
+	}).Warnln("Fixed dialer DEAD, fallback to", fallbackName)
+}
+
 // Select selects a dialer from group according to selectionPolicy. It is a
 // convenience wrapper around SelectWithExclusion with no excluded dialer.
 // If 'strictIpVersion' is false and no alive dialer, it will fallback to another ipversion.
+// Select is a backward-compatible wrapper for SelectWithExclusion.
 func (g *DialerGroup) Select(networkType *dialer.NetworkType, strictIpVersion bool) (d *dialer.Dialer, latency time.Duration, err error) {
 	return g.SelectWithExclusion(networkType, strictIpVersion, nil)
 }
@@ -602,6 +636,9 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			}
 			if len(aliveList) > 0 {
 				chosen := aliveList[int(fastrand.Int63n(int64(len(aliveList))))]
+				if policy.FixedIndex >= 0 && policy.FixedIndex < len(g.Dialers) {
+					g.logFixedFallbackDetail(g.Dialers[policy.FixedIndex], chosen, networkType, 0)
+				}
 				selected := preferAlternateSelectionNetworkType(chosen, networkType)
 				return chosen, 0, selected, nil
 			}
@@ -617,6 +654,9 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				}
 				d, latency := a.GetMinLatency(nil)
 				if d != nil {
+					if policy.FixedIndex >= 0 && policy.FixedIndex < len(g.Dialers) {
+						g.logFixedFallbackDetail(g.Dialers[policy.FixedIndex], d, networkType, latency)
+					}
 					selected := preferAlternateSelectionNetworkType(d, &networkTypes[i])
 					return d, latency, selected, nil
 				}
