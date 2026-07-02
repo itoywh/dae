@@ -136,7 +136,22 @@ func newCollection() *collection {
 }
 
 func (d *Dialer) mustGetCollection(typ *NetworkType) *collection {
-	return d.collections[typ.Index()]
+	idx := typ.Index()
+	// When udp_check_dns is not configured, DNS-UDP collections (IdxDnsUdp4/6)
+	// are never probed and their Alive flag stays true forever (initial value).
+	// This false-positive "alive" breaks the fixed_fallback retry state machine
+	// because DNS UDP always resets the retry timer before TCP can advance it.
+	// Solution: redirect DNS-UDP lookups to the corresponding TCP collection
+	// (same IP version) so they share the same (correct) Alive value.
+	if len(d.CheckDnsOptionRaw.Raw) == 0 {
+		switch idx {
+		case IdxDnsUdp4:
+			idx = IdxTcp4
+		case IdxDnsUdp6:
+			idx = IdxTcp6
+		}
+	}
+	return d.collections[idx]
 }
 
 func (d *Dialer) MustGetAlive(typ *NetworkType) bool {
@@ -511,6 +526,16 @@ func (d *Dialer) aliveBackground() {
 	}
 
 	cycle := d.CheckInterval
+	if cycle > 0 && cycle < 2*time.Second {
+		cycle = 2 * time.Second
+		if d.Log != nil {
+			d.Log.WithFields(logrus.Fields{
+				"dialer":   d.Property().Name,
+				"interval": d.CheckInterval.String(),
+				"actual":   cycle.String(),
+			}).Warnln("check_interval too low, clamped to minimum 2s to prevent probe storm")
+		}
+	}
 	var tcpSomark uint32
 	var mptcp bool
 	if network, err := netproxy.ParseMagicNetwork(d.TcpCheckOptionRaw.ResolverNetwork); err == nil {
@@ -766,6 +791,14 @@ func (d *Dialer) aliveBackground() {
 		case <-waitDone:
 		case <-d.ctx.Done():
 			return
+		case <-time.After(cycle + 5*time.Second):
+			// Probe(s) appear stuck — log diagnostic and continue.
+			// The stuck probe will eventually resolve, but we don't block
+			// the entire check cycle waiting for it.
+			if d.Log != nil {
+				d.Log.WithField("dialer", d.Property().Name).
+					Warnln("Health check probe appears stuck; continuing cycle")
+			}
 		}
 		if checkFamily == "" {
 			// Stability-based wash white: only reset stability if a protocol family had failures
