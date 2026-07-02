@@ -532,9 +532,9 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 		// When the fixed dialer is backoff/dead, it will retry with configurable
 		// timeout and max retries before falling back to the configured fallback policy.
 		// When the fixed dialer revives, traffic automatically returns to it.
+		var fixedName string
 		if policy.FixedIndex >= 0 && policy.FixedIndex < len(g.Dialers) {
 			fixedDialer := g.Dialers[policy.FixedIndex]
-			fixedName := ""
 			if p := fixedDialer.Property(); p != nil {
 				fixedName = p.Name
 			}
@@ -602,6 +602,12 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			}
 			if len(aliveList) > 0 {
 				chosen := aliveList[int(fastrand.Int63n(int64(len(aliveList))))]
+				g.log.WithFields(logrus.Fields{
+					"group":  g.Name,
+					"fixed":  fixedName,
+					"dialer": chosen.Property().Name,
+					"policy": "random",
+				}).Warnf("Fixed dialer dead, fallback to %s (random)", chosen.Property().Name)
 				selected := preferAlternateSelectionNetworkType(chosen, networkType)
 				return chosen, 0, selected, nil
 			}
@@ -617,6 +623,12 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				}
 				d, latency := a.GetMinLatency(nil)
 				if d != nil {
+					g.log.WithFields(logrus.Fields{
+						"group":  g.Name,
+						"fixed":  fixedName,
+						"dialer": d.Property().Name,
+						"policy": policy.FallbackPolicy,
+					}).Warnf("Fixed dialer dead, fallback to %s (%v)", d.Property().Name, policy.FallbackPolicy)
 					selected := preferAlternateSelectionNetworkType(d, &networkTypes[i])
 					return d, latency, selected, nil
 				}
