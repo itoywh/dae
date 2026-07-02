@@ -41,6 +41,9 @@ type DialerGroup struct {
 	resuscitateLastTime atomic.Int64
 	noAliveLogLastTimes [8]atomic.Int64
 
+	// udp_check_dns configured flag
+	hasUdpDnsCheck bool
+
 	// fixed_fallback retry state
 	fixedFallbackDeadSince  atomic.Int64
 	fixedFallbackRetryCount atomic.Int64
@@ -79,7 +82,15 @@ func NewDialerGroup(
 		dialersAnnotations:  dialersAnnotations,
 		checkTolerance:      option.CheckTolerance,
 		aliveChangeCallback: aliveChangeCallback,
+		hasUdpDnsCheck:      len(option.CheckDnsOptionRaw.Raw) > 0,
 	}
+
+	if !group.hasUdpDnsCheck && log != nil {
+		log.WithFields(logrus.Fields{
+			"group": name,
+		}).Infoln("udp_check_dns not configured, DNS UDP status follows TCP")
+	}
+
 	state := group.buildSelectionState(p, true)
 	group.registerAliveDialerSets(state.aliveDialerSets)
 	group.selectionState.Store(state)
@@ -111,6 +122,9 @@ func NewDialerGroup(
 	}
 
 	for _, nt := range standardSelectionNetworkTypes() {
+		if nt.L4Proto == consts.L4ProtoStr_UDP && nt.IsDnsSemantic() && !group.hasUdpDnsCheck {
+			continue
+		}
 		aliveChangeCallback(true, nt, true)
 	}
 
@@ -732,6 +746,13 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 
 	for i, nt := range specs {
 		networkType := *nt
+
+		// Skip DNS UDP types when udp_check_dns is not configured.
+		// Their AliveDialerSet slots will be aliased to TCP below.
+		if networkType.L4Proto == consts.L4ProtoStr_UDP && networkType.IsDnsSemantic() && !g.hasUdpDnsCheck {
+			continue
+		}
+
 		// For FixedWithFallback, build the AliveDialerSet using FallbackPolicy
 		// so that latency data is properly tracked for the fallback path.
 		// The main (fixed) path bypasses the set entirely, so using FallbackPolicy
@@ -761,6 +782,12 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 				state.aliveDialerSets[dialer.IdxDnsTcp6] = set
 			}
 		}
+	}
+	// When udp_check_dns is not configured, alias DNS UDP slots to TCP sets
+	// so routing lookups don't hit nil.
+	if !g.hasUdpDnsCheck {
+		state.aliveDialerSets[dialer.IdxDnsUdp4] = state.aliveDialerSets[dialer.IdxTcp4]
+		state.aliveDialerSets[dialer.IdxDnsUdp6] = state.aliveDialerSets[dialer.IdxTcp6]
 	}
 	return state
 }
