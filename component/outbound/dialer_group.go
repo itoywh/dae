@@ -60,6 +60,10 @@ type DialerGroup struct {
 	// fixed_fallback detail log rate limit (timestamp-based, 10s cooldown)
 	fixedFallbackDetailLog atomic.Int64
 
+	// stopCh signals background goroutines (e.g. runFixedFallbackRetry) to exit
+	// on Close(), preventing hangs during reload/shutdown with long ticker intervals.
+	stopCh chan struct{}
+
 	cachedMinCheckInterval time.Duration
 }
 
@@ -90,6 +94,7 @@ func NewDialerGroup(
 		checkTolerance:      option.CheckTolerance,
 		aliveChangeCallback: aliveChangeCallback,
 		hasUdpDnsCheck:      len(option.CheckDnsOptionRaw.Raw) > 0,
+		stopCh:              make(chan struct{}),
 	}
 
 	if !group.hasUdpDnsCheck && log != nil {
@@ -137,6 +142,14 @@ func NewDialerGroup(
 
 func (g *DialerGroup) Close() error {
 	g.unregisterAliveDialerSets(g.currentSelectionState().aliveDialerSets)
+	// Signal background goroutines to exit. Safe to close multiple times
+	// because this is only called from the group lifecycle owner.
+	select {
+	case <-g.stopCh:
+		// Already closed.
+	default:
+		close(g.stopCh)
+	}
 	return nil
 }
 
@@ -856,6 +869,8 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 	for {
 		select {
 		case <-ticker.C:
+		case <-g.stopCh:
+			return
 		}
 
 		// Check if node has recovered
