@@ -63,10 +63,6 @@ type DialerGroup struct {
 	// stopCh signals background goroutines (e.g. runFixedFallbackRetry) to exit
 	// on Close(), preventing hangs during reload/shutdown with long ticker intervals.
 	stopCh chan struct{}
-	// stopOnce guards stopCh close so concurrent Close() calls never double-close
-	// (which would panic). The previous select-based guard was not atomic across
-	// goroutines.
-	stopOnce sync.Once
 
 	cachedMinCheckInterval time.Duration
 }
@@ -124,7 +120,7 @@ func NewDialerGroup(
 					return
 				}
 				if group.fixedFallbackRunning.CompareAndSwap(false, true) {
-					group.fixedFallbackMu.Lock()
+				group.fixedFallbackMu.Lock()
 					group.fixedFallbackDeadSince = time.Now().UnixNano()
 					group.fixedFallbackRetryCount = 0
 					group.fixedFallbackMu.Unlock()
@@ -146,9 +142,14 @@ func NewDialerGroup(
 
 func (g *DialerGroup) Close() error {
 	g.unregisterAliveDialerSets(g.currentSelectionState().aliveDialerSets)
-	// Signal background goroutines to exit. sync.Once makes this idempotent and
-	// safe under concurrent Close() calls.
-	g.stopOnce.Do(func() { close(g.stopCh) })
+	// Signal background goroutines to exit. Safe to close multiple times
+	// because this is only called from the group lifecycle owner.
+	select {
+	case <-g.stopCh:
+		// Already closed.
+	default:
+		close(g.stopCh)
+	}
 	return nil
 }
 
@@ -355,8 +356,8 @@ func (g *DialerGroup) logNoAlive(
 }
 
 // logFixedFallback records state transitions for the fixed_fallback policy.
-// Mark values: 0=alive/recovery, 1=dead_detected (retry 1),
-// >=10=retry step (retryCount = state - 10).
+// Mark values: 0=alive/recovery, 1=dead_detected, >=10=retry step,
+// -1=fallen back to alternative.
 func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *dialer.NetworkType) {
 	if g.log == nil {
 		return
@@ -378,27 +379,35 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 			}).Infoln("Fixed dialer is ALIVE, traffic restored")
 		}
 	case state == 1:
-		// First time detecting dead: log as retry 1
+		// First time detecting dead: log and update state
 		old := g.fixedFallbackLastLogMark.Swap(1)
 		if old != 1 {
 			g.log.WithFields(logrus.Fields{
 				"group":   g.Name,
 				"dialer":  nodeName,
 				"network": nt.String(),
-			}).Warnln("Fixed dialer DEAD, retry 1")
+			}).Warnln("Fixed dialer DEAD, starting retry")
 		}
 	case state >= 10:
-		// Retry: log the actual retry count (state - 10) with node name
-		// and elapsed time since first dead detection, inline.
+		// Retry: log the actual retry count (state - 10)
 		retryCount := state - 10
 		old := g.fixedFallbackLastLogMark.Swap(state)
 		if old != state {
-			elapsed := time.Since(time.Unix(0, g.fixedFallbackDeadSince)).Seconds()
 			g.log.WithFields(logrus.Fields{
 				"group":   g.Name,
 				"dialer":  nodeName,
 				"network": nt.String(),
-			}).Infof("Fixed dialer retry %d (%s) @%.1fs", retryCount, nodeName, elapsed)
+			}).Infoln("Fixed dialer retry", retryCount)
+		}
+	case state < 0:
+		// Fallen back to alternative
+		old := g.fixedFallbackLastLogMark.Swap(-1)
+		if old >= 0 {
+			g.log.WithFields(logrus.Fields{
+				"group":   g.Name,
+				"dialer":  nodeName,
+				"network": nt.String(),
+			}).Warnln("Fixed dialer DEAD, fallen back to alternative")
 		}
 	}
 }
@@ -525,7 +534,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			nt := &networkTypes[i]
 
 			// Try fixed dialer first
-			if fixed != nil && fixed.AliveForRetry(nt) {
+			if fixed != nil && fixed.MustGetAlive(nt) {
 				// Node is alive → reset retry state and use it
 				g.fixedFallbackMu.Lock()
 				wasDead := g.fixedFallbackDeadSince != 0
@@ -546,7 +555,6 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			var (
 				nowNano       int64
 				deadSinceNano int64
-				logRetry1     bool
 			)
 
 			g.fixedFallbackMu.Lock()
@@ -558,6 +566,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				// Retries exhausted by background goroutine.
 				// Fallback until health check recovers the node.
 				g.fixedFallbackMu.Unlock()
+				g.logFixedFallback(-1, fixed, nt)
 				goto doFallback
 			}
 
@@ -566,12 +575,12 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				g.fixedFallbackDeadSince = nowNano
 				g.fixedFallbackRetryCount = 0
 				g.fixedFallbackMu.Unlock()
-				logRetry1 = true
+				g.logFixedFallback(1, fixed, nt)
 
 				// Start background retry goroutine if not already running
 				// (may have been started by aliveTransitionCallback already).
 				if g.fixedFallbackRunning.CompareAndSwap(false, true) {
-					go g.runFixedFallbackRetry(fixed, policy, nt)
+				go g.runFixedFallbackRetry(fixed, policy, nt)
 				}
 
 				// Background goroutine handles retries separately.
@@ -582,6 +591,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			// Node already known dead. Background goroutine owns retries.
 			// Fallback immediately — no retryCount/elapsed check.
 			g.fixedFallbackMu.Unlock()
+			g.logFixedFallback(-1, fixed, nt)
 			goto doFallback
 
 		doFallback:
@@ -590,9 +600,6 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				d := a.GetRandExcluded(excluded)
 				if d != nil {
 					g.logFixedFallbackDetail(fixed, d, nt, 0)
-					if logRetry1 {
-						g.logFixedFallback(1, fixed, nt)
-					}
 					selected := preferAlternateSelectionNetworkType(d, nt)
 					return d, 0, selected, nil
 				}
@@ -602,9 +609,6 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				d, lat := a.GetMinLatency(excluded)
 				if d != nil {
 					g.logFixedFallbackDetail(fixed, d, nt, lat)
-					if logRetry1 {
-						g.logFixedFallback(1, fixed, nt)
-					}
 					selected := preferAlternateSelectionNetworkType(d, nt)
 					return d, lat, selected, nil
 				}
@@ -844,18 +848,15 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 		g.fixedFallbackDone = true
 		g.fixedFallbackDeadSince = time.Now().UnixNano() - 1
 		g.fixedFallbackMu.Unlock()
+		g.logFixedFallback(-1, fixed, nt)
 		return
 	}
 
 	// Fire an immediate probe before entering the ticker loop,
 	// so a brief transient failure can be recovered without waiting
-	// a full ticker period (e.g. 3s). This counts as the first retry.
+	// a full ticker period (e.g. 3s).
 	fixed.NotifyCheckTcp()
 	fixed.NotifyCheckDnsUdp()
-	g.fixedFallbackMu.Lock()
-	g.fixedFallbackRetryCount = 1
-	g.fixedFallbackDeadSince = time.Now().UnixNano()
-	g.fixedFallbackMu.Unlock()
 
 	actualTimeout := policy.FixedFallbackTimeout
 	if actualTimeout < 2*time.Second {
@@ -879,21 +880,10 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 		}
 
 		// Check if node has recovered
-		if fixed.AliveForRetry(nt) {
+		if fixed.MustGetAlive(nt) {
 			g.resetFixedFallback()
 			return
 		}
-
-		// Check if retries already satisfied by the immediate probe
-		// (e.g. retries=1: immediate probe was the only shot)
-		g.fixedFallbackMu.Lock()
-		if g.fixedFallbackRetryCount >= int64(policy.FixedFallbackRetries) {
-			g.fixedFallbackDone = true
-			g.fixedFallbackDeadSince = time.Now().UnixNano() - 1
-			g.fixedFallbackMu.Unlock()
-			return
-		}
-		g.fixedFallbackMu.Unlock()
 
 		// Advance retry count
 		g.fixedFallbackMu.Lock()
