@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -498,6 +499,48 @@ func (d *Dialer) ReloadHealthSnapshot() DialerHealthSnapshot {
 	}
 	snapshot.Recovery = [3]DialerRecoveryHealthSnapshot{}
 	return snapshot
+}
+
+// CheckConfigEqual reports whether the health-check configuration of this
+// dialer equals other's. It is used during a warm reload (see
+// ControlPlane.InheritDialerHealthFrom) to decide whether the inherited health
+// snapshot from the previous generation is still valid. If the configuration
+// changed, the snapshot must NOT be restored so the dialer re-probes its new
+// targets immediately instead of deferring by one check cycle
+// (daeuniverse/dae#1037).
+//
+// Note: TcpCheckOptionRaw/CheckDnsOptionRaw contain mutexes and parsed-option
+// caches, so they are not comparable with ==. We compare the raw configured
+// values and the scalar knobs instead. The Log field of TcpCheckOptionRaw is
+// intentionally excluded because it is not part of the health-check
+// configuration.
+func (d *Dialer) CheckConfigEqual(other *Dialer) bool {
+	if d == nil || other == nil {
+		return false
+	}
+	if !slices.Equal(d.TcpCheckOptionRaw.Raw, other.TcpCheckOptionRaw.Raw) {
+		return false
+	}
+	if d.TcpCheckOptionRaw.ResolverNetwork != other.TcpCheckOptionRaw.ResolverNetwork ||
+		d.TcpCheckOptionRaw.Method != other.TcpCheckOptionRaw.Method {
+		return false
+	}
+	if !slices.Equal(d.CheckDnsOptionRaw.Raw, other.CheckDnsOptionRaw.Raw) {
+		return false
+	}
+	if d.CheckDnsOptionRaw.ResolverNetwork != other.CheckDnsOptionRaw.ResolverNetwork ||
+		d.CheckDnsOptionRaw.Somark != other.CheckDnsOptionRaw.Somark {
+		return false
+	}
+	// InstanceOption is comparable today (only DisableCheck bool). If future
+	// fields break == comparability, fall back to per-field comparison:
+	//   d.InstanceOption.DisableCheck == other.InstanceOption.DisableCheck
+	if d.InstanceOption != other.InstanceOption {
+		return false
+	}
+	return d.CheckInterval == other.CheckInterval &&
+		d.CheckTolerance == other.CheckTolerance &&
+		d.CheckDnsTcp == other.CheckDnsTcp
 }
 
 func (d *Dialer) RestoreHealthSnapshot(snapshot DialerHealthSnapshot) {
