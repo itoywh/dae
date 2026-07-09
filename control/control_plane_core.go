@@ -123,11 +123,6 @@ type controlPlaneCore struct {
 	domainRouting       *domainRoutingTracker
 	lpmTrieIndices      []uint32
 	bpfOwned            bool
-
-	// datapathIfaces records the interfaces that were successfully bound,
-	// so validateDatapathBindings can verify the filters are actually attached.
-	datapathIfaces []boundIface
-	datapathMu     sync.Mutex
 }
 
 func newControlPlaneCore(log *logrus.Logger,
@@ -445,7 +440,6 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 	default:
 	}
 	c.log.Infof("Bind to LAN: %v", ifname)
-	c.recordBoundIface(ifname, "LAN", 0x2023)
 
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
@@ -662,8 +656,6 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 	default:
 	}
 	c.log.Infof("Bind to WAN: %v", ifname)
-	c.recordBoundIface(ifname, "WAN", 0x2023)
-
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
 		return err
@@ -848,7 +840,6 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	if err := netlink.FilterAdd(filterDae0Ingress); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
-	c.recordBoundIface(daens.Dae0().Attrs().Name, "dae0", 0x2022)
 	dae0DetachFunc := func() error {
 		if err := netlink.FilterDel(filterDae0Ingress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
 			return fmt.Errorf("FilterDel(%v:%v): %w", daens.Dae0().Attrs().Name, filterDae0Ingress.Name, err)
@@ -859,82 +850,48 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	return
 }
 
-// boundIface is an interface that was successfully bound, paired with the TC
-// handle major and a human-readable label, so validateDatapathBindings can
-// confirm the corresponding filter is actually attached.
-type boundIface struct {
-	name  string
-	label string
-	major uint16
-}
-
+// validateDatapathBindings verifies that TC filters are actually attached on
+// the expected interfaces after commitInterfaceBindings.  This catches silent
+// failures where bindLan/bindWan/bindDaens partially succeed (e.g. qdisc
+// missing → FilterAdd silently fails, or the interface disappeared between
+// lookup and attach).  Returns nil when all required filters are present;
+// returns an error listing every missing binding so callers can decide to
+// rollback (reload) or abort (startup).
 // linkByName looks up a network interface by name. It is a package-level
 // variable (defaulting to netlink.LinkByName) so tests can substitute a mock.
-var linkByName = netlink.LinkByName
-
-// recordBoundIface records a successfully bound interface so that a later
-// validateDatapathBindings call can confirm its TC filter is attached.
-func (c *controlPlaneCore) recordBoundIface(name, label string, major uint16) {
-	c.datapathMu.Lock()
-	c.datapathIfaces = append(c.datapathIfaces, boundIface{name: name, label: label, major: major})
-	c.datapathMu.Unlock()
+var linkByName = func(name string) (netlink.Link, error) {
+	return netlink.LinkByName(name)
 }
 
-// resetBoundIfaces clears the recorded bindings so each commitInterfaceBindings
-// run validates only the interfaces bound during that run.
-func (c *controlPlaneCore) resetBoundIfaces() {
-	c.datapathMu.Lock()
-	c.datapathIfaces = nil
-	c.datapathMu.Unlock()
-}
-
-// validateDatapathBindings verifies that TC filters are actually attached on
-// every interface that was successfully bound during commitInterfaceBindings.
-// This catches silent failures where bindLan/bindWan/bindDaens partially
-// succeed (e.g. qdisc missing → FilterAdd silently fails, or the interface
-// disappeared between lookup and attach). It validates only the *resolved*
-// interface names recorded by the bind functions (so a configured "auto" LAN
-// is expanded to the real NIC, and dae0 is only checked when it was actually
-// created), which keeps it correct in both unit-test and production settings.
-//
-// The returned bool reports whether a *fatal* binding is missing — currently
-// only the dae0 host veth, which dae itself creates and fully controls. A
-// missing dae0 filter means the transparent proxy cannot function at all, so
-// it aborts startup/reload. LAN/WAN filters depend on the host environment
-// (e.g. clsact availability on user interfaces, which can be unavailable when
-// dae runs inside a container), so a missing LAN/WAN filter is reported but
-// does not abort — it is surfaced as a warning so operators still get
-// visibility into silent datapath breakage without breaking environments
-// where such filters legitimately cannot be attached.
-func (c *controlPlaneCore) validateDatapathBindings() (missing []string, fatal bool) {
-	c.datapathMu.Lock()
-	ifaces := make([]boundIface, len(c.datapathIfaces))
-	copy(ifaces, c.datapathIfaces)
-	c.datapathMu.Unlock()
-
-	for _, bi := range ifaces {
-		link, err := linkByName(bi.name)
+func (c *controlPlaneCore) validateDatapathBindings(lanIfaces, wanIfaces []string) []string {
+	var missing []string
+	check := func(ifname string, label string, major uint16) {
+		link, err := linkByName(ifname)
 		if err != nil {
-			missing = append(missing, fmt.Sprintf("%s (%s, link not found)", bi.name, bi.label))
-			if bi.label == "dae0" {
-				fatal = true
-			}
-			continue
+			missing = append(missing, fmt.Sprintf("%s (%s, link not found)", ifname, label))
+			return
 		}
-		if !hasDaeTcFilter(link, bi.major) {
-			missing = append(missing, fmt.Sprintf("%s (%s, handle 0x%x missing)", bi.name, bi.label, bi.major))
-			if bi.label == "dae0" {
-				fatal = true
-			}
+		if !hasDaeTcFilter(link, major) {
+			missing = append(missing, fmt.Sprintf("%s (%s, handle 0x%x missing)", ifname, label, major))
 		}
 	}
-	return missing, fatal
+
+	check(HostVethName, "dae0", 0x2022)
+	for _, iface := range lanIfaces {
+		check(iface, "LAN", 0x2023)
+	}
+	for _, iface := range wanIfaces {
+		check(iface, "WAN", 0x2023)
+	}
+	return missing
 }
 
 // filterLister lists TC filters attached to link on the given parent. It is a
 // package-level variable (defaulting to netlink.FilterList) so tests can swap
 // in a mock without touching the real netlink stack.
-var filterLister = netlink.FilterList
+var filterLister = func(link netlink.Link, parent uint32) ([]netlink.Filter, error) {
+	return netlink.FilterList(link, parent)
+}
 
 // hasDaeTcFilter reports whether any TC filter with the given major handle
 // (e.g. 0x2022 for dae0, 0x2023 for LAN/WAN) exists on link in either the
@@ -946,7 +903,7 @@ func hasDaeTcFilter(link netlink.Link, major uint16) bool {
 			continue // no clsact qdisc attached
 		}
 		for _, f := range filters {
-			if uint16(f.Attrs().Handle>>16) == major {
+			if uint16(f.Attrs().Handle >> 16) == major {
 				return true
 			}
 		}
