@@ -829,12 +829,11 @@ func newControlPlaneWithContextOptions(
 		if err = plane.commitInterfaceBindings(); err != nil {
 			return nil, err
 		}
-		// Confirm TC filters are actually attached. A silent bind failure
-		// (e.g. missing clsact qdisc, interface disappeared) would otherwise
-		// cause traffic to bypass the proxy with no error. Missing LAN/WAN
-		// filters are auto re-attached (self-heal); a missing dae0 aborts.
-		if missing, fatal := core.repairDatapathBindings(); len(missing) > 0 {
-			msg := fmt.Sprintf("datapath validation failed after interface binding (self-heal could not recover): %v", missing)
+		// Validate that TC filters are actually attached.  A silent bind
+		// failure (e.g. missing clsact qdisc, interface disappeared) would
+		// otherwise cause traffic to bypass the proxy with no error.
+		if missing, fatal := core.validateDatapathBindings(); len(missing) > 0 {
+			msg := fmt.Sprintf("datapath validation failed after interface binding: %v", missing)
 			if fatal {
 				return nil, fmt.Errorf("%s", msg)
 			}
@@ -1503,12 +1502,11 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 	if err := c.commitInterfaceBindings(); err != nil {
 		return err
 	}
-	// Confirm TC filters are actually attached. Catches silent failures in
-	// bindLan/bindWan/bindDaens that would otherwise cause traffic to bypass
-	// the proxy with no error logged. Missing LAN/WAN filters are auto
-	// re-attached (self-heal); a missing dae0 aborts.
-	if missing, fatal := c.core.repairDatapathBindings(); len(missing) > 0 {
-		msg := fmt.Sprintf("datapath validation failed after interface binding (self-heal could not recover): %v", missing)
+	// Validate that TC filters are actually attached.  Catches silent failures
+	// in bindLan/bindWan/bindDaens that would otherwise cause traffic to bypass
+	// the proxy with no error logged.
+	if missing, fatal := c.core.validateDatapathBindings(); len(missing) > 0 {
+		msg := fmt.Sprintf("datapath validation failed after interface binding: %v", missing)
 		if fatal {
 			return fmt.Errorf("%s", msg)
 		}
@@ -3653,11 +3651,6 @@ func (c *ControlPlane) closeTail() error {
 			core := c.core
 			log := c.log
 			go func() {
-				defer func() {
-					if r := recover(); r != nil && log != nil {
-						log.Warnf("[Reload] Async core cleanup panicked (recovered): %v", r)
-					}
-				}()
 				if err := core.Close(); err != nil && log != nil {
 					log.WithError(err).Warn("[Reload] Async core cleanup after staged handoff")
 				}
