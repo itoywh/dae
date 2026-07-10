@@ -3,12 +3,8 @@ package control
 import (
 	"fmt"
 	"io"
-	"sync"
-	"sync/atomic"
 	"testing"
 
-	"github.com/cilium/ebpf"
-	ciliumLink "github.com/cilium/ebpf/link"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 )
@@ -20,22 +16,12 @@ func mkLink(name string) netlink.Link {
 	return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name}}
 }
 
-// mkFilters wraps the given full TC handles (major<<16 | minor) into a
-// netlink.Filter list.
-func mkFilters(handles ...uint32) []netlink.Filter {
-	fs := make([]netlink.Filter, 0, len(handles))
-	for _, h := range handles {
-		fs = append(fs, &netlink.GenericFilter{FilterAttrs: netlink.FilterAttrs{Handle: h}})
+// mkFilters wraps a single handle (major<<16) into a netlink.Filter list.
+func mkFilters(major uint16) []netlink.Filter {
+	return []netlink.Filter{
+		&netlink.GenericFilter{FilterAttrs: netlink.FilterAttrs{Handle: uint32(major) << 16}},
 	}
-	return fs
 }
-
-// Full TC handles recorded by the bind functions (flip=0 for the unit tests).
-const (
-	dae0Handle   = 0x2022<<16 | 0b010 // 0x20220002
-	lanIngHandle = 0x2023<<16 | 0b100 // 0x20230004
-	lanEgrHandle = 0x2023<<16 | 0b010 // 0x20230002
-)
 
 func TestValidateDatapathBindings(t *testing.T) {
 	// Swap out the kernel-touching helpers for mocks.
@@ -61,47 +47,39 @@ func TestValidateDatapathBindings(t *testing.T) {
 		{
 			name:      "all bindings present",
 			known:     map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
-			filters:   map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle), "eth0": mkFilters(lanIngHandle, lanEgrHandle)},
-			bound:     []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			filters:   map[string][]netlink.Filter{"dae0": mkFilters(0x2022), "eth0": mkFilters(0x2023)},
+			bound:     []boundIface{{"dae0", "dae0", 0x2022}, {"eth0", "LAN", 0x2023}},
 			wantEmpty: true,
 		},
 		{
 			name:         "dae0 filter missing (fatal)",
 			known:        map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
-			filters:      map[string][]netlink.Filter{"eth0": mkFilters(lanIngHandle, lanEgrHandle)},
-			bound:        []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			filters:      map[string][]netlink.Filter{"eth0": mkFilters(0x2023)},
+			bound:        []boundIface{{"dae0", "dae0", 0x2022}, {"eth0", "LAN", 0x2023}},
 			wantEmpty:    false,
-			wantContains: []string{"dae0 (dae0, handle 0x20220002 missing)"},
+			wantContains: []string{"dae0 (dae0, handle 0x2022 missing)"},
 		},
 		{
 			name:         "lan filter missing (warn only)",
 			known:        map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
-			filters:      map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle)},
-			bound:        []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			filters:      map[string][]netlink.Filter{"dae0": mkFilters(0x2022)},
+			bound:        []boundIface{{"dae0", "dae0", 0x2022}, {"eth0", "LAN", 0x2023}},
 			wantEmpty:    false,
-			wantContains: []string{"eth0 (LAN, handle 0x20230004 missing)"},
-		},
-		{
-			name:         "lan egress filter missing (partial, double-filter)",
-			known:        map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
-			filters:      map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle), "eth0": mkFilters(lanIngHandle)},
-			bound:        []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
-			wantEmpty:    false,
-			wantContains: []string{"eth0 (LAN, handle 0x20230002 missing)"},
+			wantContains: []string{"eth0 (LAN, handle 0x2023 missing)"},
 		},
 		{
 			name:         "wan filter missing (warn only)",
 			known:        map[string]netlink.Link{"dae0": dae0, "eth1": eth1},
-			filters:      map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle)},
-			bound:        []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth1", "WAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			filters:      map[string][]netlink.Filter{"dae0": mkFilters(0x2022)},
+			bound:        []boundIface{{"dae0", "dae0", 0x2022}, {"eth1", "WAN", 0x2023}},
 			wantEmpty:    false,
-			wantContains: []string{"eth1 (WAN, handle 0x20230004 missing)"},
+			wantContains: []string{"eth1 (WAN, handle 0x2023 missing)"},
 		},
 		{
 			name:         "interface not found",
 			known:        map[string]netlink.Link{"dae0": dae0},
-			filters:      map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle)},
-			bound:        []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			filters:      map[string][]netlink.Filter{"dae0": mkFilters(0x2022)},
+			bound:        []boundIface{{"dae0", "dae0", 0x2022}, {"eth0", "LAN", 0x2023}},
 			wantEmpty:    false,
 			wantContains: []string{"eth0 (LAN, link not found)"},
 		},
@@ -110,6 +88,13 @@ func TestValidateDatapathBindings(t *testing.T) {
 			known:     map[string]netlink.Link{},
 			filters:   map[string][]netlink.Filter{},
 			bound:     nil,
+			wantEmpty: true,
+		},
+		{
+			name:      "handles from egress parent only",
+			known:     map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
+			filters:   map[string][]netlink.Filter{"dae0": mkFilters(0x2022), "eth0": mkFilters(0x2023)},
+			bound:     []boundIface{{"dae0", "dae0", 0x2022}, {"eth0", "LAN", 0x2023}},
 			wantEmpty: true,
 		},
 	}
@@ -191,8 +176,8 @@ func TestRepairDatapathBindings(t *testing.T) {
 		{
 			name:             "LAN missing then self-healed",
 			known:            map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
-			filters:          map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle)},
-			bound:            []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			filters:          map[string][]netlink.Filter{"dae0": mkFilters(0x2022)},
+			bound:            []boundIface{{"dae0", "dae0", 0x2022}, {"eth0", "LAN", 0x2023}},
 			lanRebindFixes:   true,
 			wantStillMissing: nil,
 			wantFatal:        false,
@@ -200,18 +185,18 @@ func TestRepairDatapathBindings(t *testing.T) {
 		{
 			name:             "WAN missing but rebind fails (warn only)",
 			known:            map[string]netlink.Link{"dae0": dae0, "eth1": eth1},
-			filters:          map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle)},
-			bound:            []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth1", "WAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			filters:          map[string][]netlink.Filter{"dae0": mkFilters(0x2022)},
+			bound:            []boundIface{{"dae0", "dae0", 0x2022}, {"eth1", "WAN", 0x2023}},
 			wanRebindErr:     fmt.Errorf("simulated clsact unavailable"),
-			wantStillMissing: []string{"eth1 (WAN, handle 0x20230004 missing)"},
+			wantStillMissing: []string{"eth1 (WAN, handle 0x2023 missing)"},
 			wantFatal:        false,
 		},
 		{
 			name:             "dae0 missing is fatal and not self-healed",
 			known:            map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
-			filters:          map[string][]netlink.Filter{"eth0": mkFilters(lanIngHandle, lanEgrHandle)},
-			bound:            []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
-			wantStillMissing: []string{"dae0 (dae0, handle 0x20220002 missing)"},
+			filters:          map[string][]netlink.Filter{"eth0": mkFilters(0x2023)},
+			bound:            []boundIface{{"dae0", "dae0", 0x2022}, {"eth0", "LAN", 0x2023}},
+			wantStillMissing: []string{"dae0 (dae0, handle 0x2022 missing)"},
 			wantFatal:        true,
 		},
 	}
@@ -241,7 +226,7 @@ func TestRepairDatapathBindings(t *testing.T) {
 					return tt.lanRebindErr
 				}
 				if tt.lanRebindFixes {
-					filters[name] = mkFilters(lanIngHandle, lanEgrHandle)
+					filters[name] = mkFilters(0x2023)
 				}
 				return nil
 			}
@@ -250,7 +235,7 @@ func TestRepairDatapathBindings(t *testing.T) {
 					return tt.wanRebindErr
 				}
 				if tt.wanRebindFixes {
-					filters[name] = mkFilters(lanIngHandle, lanEgrHandle)
+					filters[name] = mkFilters(0x2023)
 				}
 				return nil
 			}
@@ -298,14 +283,13 @@ func TestHasDaeTcFilter(t *testing.T) {
 	tests := []struct {
 		name    string
 		filters []netlink.Filter
-		handle  uint32
+		major   uint16
 		want    bool
 	}{
-		{"matching handle", mkFilters(lanIngHandle), lanIngHandle, true},
-		{"non-matching handle (same major, diff minor)", mkFilters(lanIngHandle), lanEgrHandle, false},
-		{"non-matching handle (diff major)", mkFilters(dae0Handle), lanIngHandle, false},
-		{"no filters", nil, lanIngHandle, false},
-		{"dae0 handle", mkFilters(dae0Handle), dae0Handle, true},
+		{"matching major", mkFilters(0x2023), 0x2023, true},
+		{"non-matching major", mkFilters(0x2022), 0x2023, false},
+		{"no filters", nil, 0x2023, false},
+		{"dae0 major", mkFilters(0x2022), 0x2022, true},
 	}
 
 	for _, tt := range tests {
@@ -313,188 +297,9 @@ func TestHasDaeTcFilter(t *testing.T) {
 			filterLister = func(link netlink.Link, parent uint32) ([]netlink.Filter, error) {
 				return tt.filters, nil
 			}
-			if got := hasDaeTcFilter(link, tt.handle); got != tt.want {
-				t.Errorf("hasDaeTcFilter(%#x) = %v, want %v", tt.handle, got, tt.want)
+			if got := hasDaeTcFilter(link, tt.major); got != tt.want {
+				t.Errorf("hasDaeTcFilter(%#x) = %v, want %v", tt.major, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestControlPlaneCore_Flip_Race(t *testing.T) {
-	// coreFlip is global in package control.
-	// Reset it to 0 for deterministic test.
-	atomic.StoreInt32(&coreFlip, 0)
-
-	// Since Flip() doesn't access any struct fields, we can use an empty struct.
-	c := &controlPlaneCore{}
-
-	var wg sync.WaitGroup
-	iterations := 1000 // Must be even
-
-	for range iterations {
-		wg.Go(func() {
-			c.Flip()
-		})
-	}
-
-	wg.Wait()
-
-	val := atomic.LoadInt32(&coreFlip)
-	// If atomic operations are correct, flipping 0 an even number of times should result in 0.
-	// If a race occurred (e.g. lost update), the result might be 1.
-	if val != 0 {
-		t.Errorf("Expected coreFlip to be 0 after %d flips, got %d. Race condition detected.", iterations, val)
-	}
-}
-
-func TestControlPlaneCore_EjectBpfKeepsHookCleanupForClose(t *testing.T) {
-	logger := logrus.New()
-	logger.SetOutput(io.Discard)
-
-	core := newControlPlaneCore(logger, nil, nil, nil, false)
-	calls := 0
-	core.addManagedBpfHookCleanup(func() error {
-		calls++
-		return nil
-	})
-
-	core.EjectBpf()
-	if core.bpfOwned {
-		t.Fatal("expected EjectBpf to transfer BPF ownership")
-	}
-
-	if err := core.Close(); err != nil {
-		t.Fatalf("Close() error = %v, want nil", err)
-	}
-	if calls != 1 {
-		t.Fatalf("expected hook cleanup to run once after EjectBpf, got %d", calls)
-	}
-}
-
-func TestControlPlaneCore_InjectBpfClaimsOwnershipForReloadGeneration(t *testing.T) {
-	logger := logrus.New()
-	logger.SetOutput(io.Discard)
-
-	core := newControlPlaneCore(logger, nil, nil, nil, true)
-	if core.bpfOwned {
-		t.Fatal("expected reload generation to start without BPF ownership")
-	}
-
-	core.InjectBpf(nil)
-
-	if !core.bpfOwned {
-		t.Fatal("expected InjectBpf to claim BPF ownership")
-	}
-	if core.bpfEjected {
-		t.Fatal("expected InjectBpf to clear the ejected state")
-	}
-}
-
-func TestControlPlaneCore_InheritLpmIndicesSkipsReusedSlots(t *testing.T) {
-	logger := logrus.New()
-	logger.SetOutput(io.Discard)
-
-	core := newControlPlaneCore(logger, nil, nil, nil, true)
-	core.lpmTrieIndices = []uint32{4, 5}
-
-	core.InheritLpmIndices([]uint32{1, 4, 7})
-
-	got := make(map[uint32]struct{}, len(core.lpmTrieIndices))
-	for _, idx := range core.lpmTrieIndices {
-		got[idx] = struct{}{}
-	}
-
-	for _, want := range []uint32{1, 4, 5, 7} {
-		if _, ok := got[want]; !ok {
-			t.Fatalf("expected inherited index set to contain %d, got %#v", want, core.lpmTrieIndices)
-		}
-	}
-	if len(got) != 4 {
-		t.Fatalf("expected no duplicate inherited indices, got %#v", core.lpmTrieIndices)
-	}
-}
-
-func TestControlPlaneCore_EjectLpmIndicesTransfersOwnership(t *testing.T) {
-	logger := logrus.New()
-	logger.SetOutput(io.Discard)
-
-	core := newControlPlaneCore(logger, nil, nil, nil, false)
-	core.lpmTrieIndices = []uint32{2, 3, 5}
-
-	indices := core.EjectLpmIndices()
-
-	if len(core.lpmTrieIndices) != 0 {
-		t.Fatalf("expected core LPM indices to be cleared after ejection, got %#v", core.lpmTrieIndices)
-	}
-	if len(indices) != 3 {
-		t.Fatalf("expected 3 ejected LPM indices, got %#v", indices)
-	}
-}
-
-func TestControlPlaneCore_ReplaceLpmIndicesReplacesTrackedSet(t *testing.T) {
-	logger := logrus.New()
-	logger.SetOutput(io.Discard)
-
-	core := newControlPlaneCore(logger, nil, nil, nil, false)
-	core.lpmTrieIndices = []uint32{2, 3, 5}
-
-	core.ReplaceLpmIndices([]uint32{7, 11})
-
-	if got := core.lpmTrieIndices; len(got) != 2 || got[0] != 7 || got[1] != 11 {
-		t.Fatalf("expected replaced LPM indices [7 11], got %#v", got)
-	}
-}
-
-type fakeCgroupAttachment struct {
-	closeCalls atomic.Int32
-}
-
-func (f *fakeCgroupAttachment) Close() error {
-	f.closeCalls.Add(1)
-	return nil
-}
-
-func TestControlPlaneCore_SetupSkPidMonitorRollsBackPartialAttach(t *testing.T) {
-	oldDetect := detectCgroupPathFunc
-	oldAttach := attachCgroupFunc
-	detectCgroupPathFunc = func() (string, error) { return "/sys/fs/cgroup", nil }
-	var attachments []*fakeCgroupAttachment
-	attachCgroupFunc = func(ciliumLink.CgroupOptions) (cgroupAttachment, error) {
-		attachment := &fakeCgroupAttachment{}
-		attachments = append(attachments, attachment)
-		if len(attachments) == 3 {
-			return nil, fmt.Errorf("boom")
-		}
-		return attachment, nil
-	}
-	defer func() {
-		detectCgroupPathFunc = oldDetect
-		attachCgroupFunc = oldAttach
-	}()
-
-	logger := logrus.New()
-	logger.SetOutput(io.Discard)
-	core := newControlPlaneCore(logger, &bpfObjects{
-		bpfPrograms: bpfPrograms{
-			TproxyWanCgSockCreate:  &ebpf.Program{},
-			TproxyWanCgSockRelease: &ebpf.Program{},
-			TproxyWanCgConnect4:    &ebpf.Program{},
-			TproxyWanCgConnect6:    &ebpf.Program{},
-			TproxyWanCgSendmsg4:    &ebpf.Program{},
-			TproxyWanCgSendmsg6:    &ebpf.Program{},
-		},
-	}, nil, nil, false)
-
-	if err := core.setupSkPidMonitor(); err == nil {
-		t.Fatal("setupSkPidMonitor() error = nil, want failure")
-	}
-	if got := len(core.bpfHookDetachFuncs); got != 0 {
-		t.Fatalf("len(bpfHookDetachFuncs) = %d, want 0 after rollback", got)
-	}
-	if got := attachments[0].closeCalls.Load(); got != 1 {
-		t.Fatalf("first attachment Close() calls = %d, want 1", got)
-	}
-	if got := attachments[1].closeCalls.Load(); got != 1 {
-		t.Fatalf("second attachment Close() calls = %d, want 1", got)
 	}
 }

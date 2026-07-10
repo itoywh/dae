@@ -445,10 +445,7 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 	default:
 	}
 	c.log.Infof("Bind to LAN: %v", ifname)
-	c.recordBoundIface(ifname, "LAN",
-		netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)), // ingress
-		netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)), // egress
-	)
+	c.recordBoundIface(ifname, "LAN", 0x2023)
 
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
@@ -665,10 +662,7 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 	default:
 	}
 	c.log.Infof("Bind to WAN: %v", ifname)
-	c.recordBoundIface(ifname, "WAN",
-		netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)), // egress
-		netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)), // ingress
-	)
+	c.recordBoundIface(ifname, "WAN", 0x2023)
 
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
@@ -829,11 +823,6 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 		})
 	}
 	c.addManagedBpfHookCleanup(detachFunc)
-	// Record the dae0peer binding (in the dae netns) so validateDatapathBindings
-	// can confirm its TC filter survived a reload. It is checked inside the dae
-	// netns; a missing dae0peer filter is a warning (non-fatal), mirroring dae0's
-	// self-heal policy without aborting the proxy.
-	c.recordBoundIface(daens.Dae0Peer().Attrs().Name, "dae0peer", netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)))
 
 	// tproxy_dae0_ingress@dae0 at host netns
 	// Best effort to add qdisc; it may already exist.
@@ -859,7 +848,7 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	if err := netlink.FilterAdd(filterDae0Ingress); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
-	c.recordBoundIface(daens.Dae0().Attrs().Name, "dae0", netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)))
+	c.recordBoundIface(daens.Dae0().Attrs().Name, "dae0", 0x2022)
 	dae0DetachFunc := func() error {
 		if err := netlink.FilterDel(filterDae0Ingress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
 			return fmt.Errorf("FilterDel(%v:%v): %w", daens.Dae0().Attrs().Name, filterDae0Ingress.Name, err)
@@ -870,16 +859,13 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	return
 }
 
-// boundIface is an interface that was successfully bound, paired with the full
-// TC filter handle(s) and a human-readable label, so validateDatapathBindings
-// can confirm the corresponding filter(s) are actually attached. LAN/WAN carry
-// two filters (ingress + egress) under the same major but different minor, so
-// handles is a slice: every listed handle must be present for the binding to be
-// considered healthy.
+// boundIface is an interface that was successfully bound, paired with the TC
+// handle major and a human-readable label, so validateDatapathBindings can
+// confirm the corresponding filter is actually attached.
 type boundIface struct {
-	name    string
-	label   string
-	handles []uint32
+	name  string
+	label string
+	major uint16
 }
 
 // linkByName looks up a network interface by name. It is a package-level
@@ -887,32 +873,18 @@ type boundIface struct {
 var linkByName = netlink.LinkByName
 
 // recordBoundIface records a successfully bound interface so that a later
-// validateDatapathBindings call can confirm its TC filter(s) are attached.
-// Duplicate (name+label+handles) entries are ignored, which keeps the recorded
+// validateDatapathBindings call can confirm its TC filter is attached.
+// Duplicate (name+label+major) entries are ignored, which keeps the recorded
 // set stable when an interface is re-bound during self-heal.
-func (c *controlPlaneCore) recordBoundIface(name, label string, handles ...uint32) {
+func (c *controlPlaneCore) recordBoundIface(name, label string, major uint16) {
 	c.datapathMu.Lock()
 	defer c.datapathMu.Unlock()
 	for _, b := range c.datapathIfaces {
-		if b.name == name && b.label == label && equalHandles(b.handles, handles) {
+		if b.name == name && b.label == label && b.major == major {
 			return
 		}
 	}
-	c.datapathIfaces = append(c.datapathIfaces, boundIface{name: name, label: label, handles: handles})
-}
-
-// equalHandles reports whether two TC handle slices contain the same handles in
-// the same order.
-func equalHandles(a, b []uint32) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	c.datapathIfaces = append(c.datapathIfaces, boundIface{name: name, label: label, major: major})
 }
 
 // resetBoundIfaces clears the recorded bindings so each commitInterfaceBindings
@@ -941,42 +913,17 @@ func (c *controlPlaneCore) resetBoundIfaces() {
 // does not abort — it is surfaced as a warning so operators still get
 // visibility into silent datapath breakage without breaking environments
 // where such filters legitimately cannot be attached.
-// checkBindingInNetns performs the actual link lookup and TC-filter check for
-// bi in whatever network namespace the caller is currently executing in. Every
-// handle recorded for bi must be attached; the first missing one is reported.
-// It is separated from checkBinding so the dae0peer case can run it inside the
-// dae netns (via GetDaeNetns().WithRequired), while all host-netns interfaces
-// run it directly.
-func (c *controlPlaneCore) checkBindingInNetns(bi boundIface) (ok bool, reason string) {
+// checkBinding reports whether the TC filter for bi is actually attached,
+// returning a human-readable reason when it is not.
+func (c *controlPlaneCore) checkBinding(bi boundIface) (ok bool, reason string) {
 	link, err := linkByName(bi.name)
 	if err != nil {
 		return false, fmt.Sprintf("%s (%s, link not found)", bi.name, bi.label)
 	}
-	for _, h := range bi.handles {
-		if !hasDaeTcFilter(link, h) {
-			return false, fmt.Sprintf("%s (%s, handle 0x%x missing)", bi.name, bi.label, h)
-		}
+	if !hasDaeTcFilter(link, bi.major) {
+		return false, fmt.Sprintf("%s (%s, handle 0x%x missing)", bi.name, bi.label, bi.major)
 	}
 	return true, ""
-}
-
-// checkBinding reports whether the TC filter(s) for bi are actually attached,
-// returning a human-readable reason when not. dae0peer lives inside the dae
-// netns (host-netns linkByName cannot see it), so its check is executed there;
-// all other interfaces are resolved in the host netns.
-func (c *controlPlaneCore) checkBinding(bi boundIface) (ok bool, reason string) {
-	if bi.label == "dae0peer" {
-		var innerOk bool
-		var innerReason string
-		if err := GetDaeNetns().WithRequired("check dae0peer binding", func() error {
-			innerOk, innerReason = c.checkBindingInNetns(bi)
-			return nil
-		}); err != nil {
-			return false, fmt.Sprintf("%s (%s, dae netns error: %v)", bi.name, bi.label, err)
-		}
-		return innerOk, innerReason
-	}
-	return c.checkBindingInNetns(bi)
 }
 
 // missingBindings returns the recorded interfaces whose TC filter is not
@@ -1026,7 +973,7 @@ var rebindWanFn = func(c *controlPlaneCore, name string) error { return c._bindW
 // attempt, plus fatal (true only when dae0 is among the still-missing), so
 // callers keep the existing fatal/warning policy unchanged:
 //   - dae0 missing  -> fatal -> caller aborts startup/reload
-//   - LAN/WAN missing but re-attached -> silently recovered (Debugf)
+//   - LAN/WAN missing but re-attached -> silently recovered (Infof)
 //   - LAN/WAN missing and re-attach failed -> warning, proxy keeps running
 func (c *controlPlaneCore) repairDatapathBindings() (stillMissing []string, fatal bool) {
 	bad, _ := c.missingBindings()
@@ -1048,10 +995,6 @@ func (c *controlPlaneCore) repairDatapathBindings() (stillMissing []string, fata
 			} else {
 				repaired = true
 			}
-		case "dae0peer":
-			// dae0peer lives in the dae netns and is created/controlled by dae,
-			// like dae0. It is not self-healed here; a missing dae0peer filter is
-			// surfaced as a (non-fatal) warning so operators keep visibility.
 		}
 		// dae0: not self-healed.
 	}
@@ -1062,7 +1005,7 @@ func (c *controlPlaneCore) repairDatapathBindings() (stillMissing []string, fata
 		stillMissing = append(stillMissing, reason)
 	}
 	if repaired && len(stillMissing) == 0 {
-		c.log.Debugf("datapath self-heal: re-attached missing LAN/WAN TC filters")
+		c.log.Infof("datapath self-heal: re-attached missing LAN/WAN TC filters")
 	}
 	return stillMissing, fatal
 }
@@ -1072,20 +1015,17 @@ func (c *controlPlaneCore) repairDatapathBindings() (stillMissing []string, fata
 // in a mock without touching the real netlink stack.
 var filterLister = netlink.FilterList
 
-// hasDaeTcFilter reports whether a TC filter with the exact given full handle
-// (major<<16 | minor, e.g. 0x20220002 for dae0, 0x20230004/0x20230002 for the
-// LAN/WAN ingress/egress pair) is attached on link in either the ingress or
-// egress parent. Comparing the full handle (not just the major) lets
-// validateDatapathBindings distinguish the two filters LAN/WAN carry under the
-// same major.
-func hasDaeTcFilter(link netlink.Link, handle uint32) bool {
+// hasDaeTcFilter reports whether any TC filter with the given major handle
+// (e.g. 0x2022 for dae0, 0x2023 for LAN/WAN) exists on link in either the
+// ingress or egress parent.  Mirrors the detection logic in bpf_purge.go.
+func hasDaeTcFilter(link netlink.Link, major uint16) bool {
 	for _, parent := range []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS} {
 		filters, err := filterLister(link, parent)
 		if err != nil {
 			continue // no clsact qdisc attached
 		}
 		for _, f := range filters {
-			if f.Attrs().Handle == handle {
+			if uint16(f.Attrs().Handle>>16) == major {
 				return true
 			}
 		}
