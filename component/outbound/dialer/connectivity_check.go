@@ -143,6 +143,29 @@ func (d *Dialer) MustGetAlive(typ *NetworkType) bool {
 	return d.mustGetCollection(typ).Alive.Load()
 }
 
+// AliveForRetry reports whether the dialer should be considered alive for
+// fixed_fallback retry/fallback decisions on network type typ.
+//
+// When udp_check_dns is not configured, the DNS-UDP collection is never probed
+// by the health-check loop and its Alive flag stays at its initial value
+// (true) forever. That false-positive "alive" would make a Select() over
+// DNS-UDP reset the fixed_fallback retry counter on every DNS resolution
+// cycle, so fallback never triggers even though the node's TCP — and thus the
+// node itself — is dead.
+//
+// To fix that without coupling the DNS-UDP and TCP collections (which would
+// break UDP health-domain independence and snapshot/restore semantics, since
+// the two network types must remain independently markable), we mirror the
+// liveness decision to the same IP family's TCP collection only at this
+// retry-decision site.
+func (d *Dialer) AliveForRetry(typ *NetworkType) bool {
+	if typ != nil && typ.L4Proto == consts.L4ProtoStr_UDP && typ.IsDns && len(d.CheckDnsOptionRaw.Raw) == 0 {
+		mirrored := &NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: typ.IpVersion}
+		return d.MustGetAlive(mirrored)
+	}
+	return d.MustGetAlive(typ)
+}
+
 func (d *Dialer) SnapshotLastProbe(typ *NetworkType) DialerProbeObservationSnapshot {
 	if d == nil || typ == nil {
 		return DialerProbeObservationSnapshot{}
