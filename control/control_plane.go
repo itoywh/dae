@@ -118,6 +118,7 @@ type ControlPlane struct {
 type controlPlaneBuildOptions struct {
 	delayDatapathCommit   bool
 	delayDNSListenerStart bool
+	dnsRoutingUnchanged   bool
 }
 
 const (
@@ -296,6 +297,7 @@ func NewControlPlaneWithContext(
 	global *config.Global,
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
+	dnsRoutingUnchanged bool,
 ) (plane *ControlPlane, err error) {
 	return newControlPlaneWithContextOptions(
 		ctx,
@@ -308,7 +310,9 @@ func NewControlPlaneWithContext(
 		global,
 		dnsConfig,
 		externGeoDataDirs,
-		controlPlaneBuildOptions{},
+		controlPlaneBuildOptions{
+			dnsRoutingUnchanged: dnsRoutingUnchanged,
+		},
 	)
 }
 
@@ -325,6 +329,7 @@ func NewPreparedControlPlaneWithContext(
 	global *config.Global,
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
+	dnsRoutingUnchanged bool,
 ) (plane *ControlPlane, err error) {
 	return newControlPlaneWithContextOptions(
 		ctx,
@@ -340,6 +345,7 @@ func NewPreparedControlPlaneWithContext(
 		controlPlaneBuildOptions{
 			delayDatapathCommit:   true,
 			delayDNSListenerStart: true,
+			dnsRoutingUnchanged:   dnsRoutingUnchanged,
 		},
 	)
 }
@@ -572,6 +578,13 @@ func newControlPlaneWithContextOptions(
 		if err != nil {
 			return nil, fmt.Errorf("failed to create group %v: %w", group.Name, err)
 		}
+		// Warn if FixedWithFallback timeout is less than 2s.
+		if policy.Policy == consts.DialerSelectionPolicy_FixedWithFallback && policy.FixedFallbackTimeout < 2*time.Second {
+			log.Warnf("Group %q: FixedWithFallback timeout %v is less than 2s; "+
+				"effective probe interval will be 2s (cooldown) to prevent probe storms. "+
+				"Consider setting timeout >= 2s to avoid request blocking.",
+				group.Name, policy.FixedFallbackTimeout)
+		}
 		// Filter nodes with user given filters.
 		dialers, annos, err := dialerSet.FilterAndAnnotate(group.Filter, group.FilterAnnotation)
 		if err != nil {
@@ -725,6 +738,7 @@ func newControlPlaneWithContextOptions(
 		preparedDatapathCommit:      buildOpts.delayDatapathCommit,
 		sharedBpfReload:             _bpf != nil,
 		pendingDnsReloadCache:       dnsCache,
+		dnsRoutingUnchanged:         buildOpts.dnsRoutingUnchanged,
 		muRealDomainSet:             sync.RWMutex{},
 		realDomainSet:               bloom.NewWithEstimates(2048, 0.001),
 		tcpSniffNegSet:              make(map[tcpSniffNegKey]tcpSniffNegEntry),
@@ -815,7 +829,18 @@ func newControlPlaneWithContextOptions(
 		if err = plane.commitInterfaceBindings(); err != nil {
 			return nil, err
 		}
-		if plane.sharedBpfReload {
+		// Confirm TC filters are actually attached. A silent bind failure
+		// (e.g. missing clsact qdisc, interface disappeared) would otherwise
+		// cause traffic to bypass the proxy with no error. Missing LAN/WAN
+		// filters are auto re-attached (self-heal); a missing dae0 aborts.
+		if missing, fatal := core.repairDatapathBindings(); len(missing) > 0 {
+			msg := fmt.Sprintf("datapath validation failed after interface binding (self-heal could not recover): %v", missing)
+			if fatal {
+				return nil, fmt.Errorf("%s", msg)
+			}
+			core.log.Warnf("%s", msg)
+		}
+		if plane.sharedBpfReload && !plane.dnsRoutingUnchanged {
 			if err = clearReloadDomainRoutingMap(core.bpf.Load()); err != nil {
 				return nil, fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
 			}
@@ -921,6 +946,16 @@ func (c *ControlPlane) PeekBpf() *bpfObjects {
 		return nil
 	}
 	return c.core.PeekBpf()
+}
+
+// isBpfEjected reports whether BPF ownership has been transferred to another
+// generation via EjectBpf. Callers use this to decide whether core.Close()
+// can run asynchronously (it is pure cleanup when BPF has been ejected).
+func (c *ControlPlane) isBpfEjected() bool {
+	if c == nil || c.core == nil {
+		return false
+	}
+	return c.core.IsBpfEjected()
 }
 
 func (c *ControlPlane) ActiveSessionCount() int {
@@ -1140,10 +1175,21 @@ func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
 			if d == nil || d.Property() == nil {
 				continue
 			}
-			if oldDialer := oldDialers[d.Property().Name]; oldDialer != nil {
-				d.RestoreHealthSnapshot(oldDialer.ReloadHealthSnapshot())
-				hasOverlap = true
+			oldDialer := oldDialers[d.Property().Name]
+			if oldDialer == nil {
+				continue
 			}
+			hasOverlap = true // same dialer exists in both generations; connections may survive
+			// If the health-check configuration changed across reload, do NOT
+			// inherit the previous generation's snapshot. Starting fresh makes
+			// the new dialer probe its (possibly changed) targets immediately
+			// instead of deferring by one check cycle (daeuniverse/dae#1037).
+			// Configuration unchanged: restore the snapshot to keep the
+			// connection-preserving, deferred-first-probe behavior.
+			if !d.CheckConfigEqual(oldDialer) {
+				continue
+			}
+			d.RestoreHealthSnapshot(oldDialer.ReloadHealthSnapshot())
 		}
 		group.EnsureReloadSelectionFloor(fallback)
 	}
@@ -1369,6 +1415,7 @@ func (c *ControlPlane) commitInterfaceBindings() error {
 	if c == nil || c.core == nil {
 		return nil
 	}
+	c.core.resetBoundIfaces()
 
 	if len(c.lanInterface) > 0 {
 		if c.autoConfigKernelParameter {
@@ -1455,6 +1502,17 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 	}
 	if err := c.commitInterfaceBindings(); err != nil {
 		return err
+	}
+	// Confirm TC filters are actually attached. Catches silent failures in
+	// bindLan/bindWan/bindDaens that would otherwise cause traffic to bypass
+	// the proxy with no error logged. Missing LAN/WAN filters are auto
+	// re-attached (self-heal); a missing dae0 aborts.
+	if missing, fatal := c.core.repairDatapathBindings(); len(missing) > 0 {
+		msg := fmt.Sprintf("datapath validation failed after interface binding (self-heal could not recover): %v", missing)
+		if fatal {
+			return fmt.Errorf("%s", msg)
+		}
+		c.log.Warnf("%s", msg)
 	}
 	if c.routingKernspaceSnapshot != nil {
 		c.log.Infoln("Loading routing rules into kernel space (BPF)...")
@@ -3578,10 +3636,36 @@ func (c *ControlPlane) closeTail() error {
 
 	// Note: inConnections is cleared by AbortConnections() which should be called before Close()
 
-	// Combine defer errors with core.Close error
+	// Core cleanup.
+	//
+	// When BPF has been ejected to the new generation (staged handoff),
+	// core.Close() only needs to detach TC filters (netlink.FilterDel) and
+	// release the UDP conn-state tracker — none of which are time-critical
+	// because the new generation already has its own TC filters attached.
+	// Run it asynchronously to avoid the 5 s closeTail timeout that fires
+	// during staged handoff retirement (dae#1013).
+	//
+	// We check isBpfEjected() rather than sharedBpfReload because the
+	// initial control plane (P0) has sharedBpfReload=false even though
+	// EjectBpf() has been called during the first staged handoff.
 	if c.core != nil {
-		if coreErr := c.core.Close(); coreErr != nil {
-			errs = append(errs, coreErr)
+		if c.isBpfEjected() {
+			core := c.core
+			log := c.log
+			go func() {
+				defer func() {
+					if r := recover(); r != nil && log != nil {
+						log.Errorf("[Reload] Async core cleanup panicked (recovered): %v", r)
+					}
+				}()
+				if err := core.Close(); err != nil && log != nil {
+					log.WithError(err).Warn("[Reload] Async core cleanup after staged handoff")
+				}
+			}()
+		} else {
+			if coreErr := c.core.Close(); coreErr != nil {
+				errs = append(errs, coreErr)
+			}
 		}
 	}
 
