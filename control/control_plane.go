@@ -3655,7 +3655,7 @@ func (c *ControlPlane) closeTail() error {
 			go func() {
 				defer func() {
 					if r := recover(); r != nil && log != nil {
-						log.Errorf("[Reload] Async core cleanup panicked (recovered): %v", r)
+						log.Warnf("[Reload] Async core cleanup panicked (recovered): %v", r)
 					}
 				}()
 				if err := core.Close(); err != nil && log != nil {
