@@ -1,9 +1,7 @@
 #!/bin/sh
 # luci-app-dae 日志页增强安装脚本
 # 仅注入「清除日志」按钮（最小化 patch，不改动上游其他代码）
-# 版本: v1.0.0
-# 固定托管地址: https://github.com/itoywh/luci-dae-logpatch
-# 用法: curl -sL https://raw.githubusercontent.com/itoywh/luci-dae-logpatch/main/install-luci-logpatch.sh | sh
+# 用法: curl -sL https://raw.githubusercontent.com/itoywh/dae/v2.0-custom/scripts/install-luci-logpatch.sh | sh
 #
 # 原理：
 #   1. log.js — 用 sed 在 scrollDownButton 后注入 clearLogButton 定义，
