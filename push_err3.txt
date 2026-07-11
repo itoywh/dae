@@ -1,3 +1,0 @@
-To https://github.com/itoywh/dae.git
- ! [rejected]          v2.0-custom -> v2.0-custom (stale info)
-error: failed to push some refs to 'https://github.com/itoywh/dae.git'
