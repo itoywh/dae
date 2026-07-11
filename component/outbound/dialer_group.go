@@ -375,7 +375,7 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 				"group":   g.Name,
 				"dialer":  nodeName,
 				"network": nt.String(),
-			}).Warnln("Fixed dialer is ALIVE, traffic restored")
+			}).Infoln("Fixed dialer is ALIVE, traffic restored")
 		}
 	case state == 1:
 		// First time detecting dead: log as retry 1
@@ -398,7 +398,7 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 				"group":   g.Name,
 				"dialer":  nodeName,
 				"network": nt.String(),
-			}).Warnf("Fixed dialer retry %d (%s) @%.1fs", retryCount, nodeName, elapsed)
+			}).Infof("Fixed dialer retry %d (%s) @%.1fs", retryCount, nodeName, elapsed)
 		}
 	}
 }
@@ -929,7 +929,7 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 					"group":   g.Name,
 					"dialer":  nodeName,
 					"network": nt.String(),
-				}).Warnln("Fixed dialer retry exhausted, probing paused")
+				}).Infoln("Fixed dialer retry exhausted, probing paused")
 			}
 			return
 		}
