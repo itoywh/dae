@@ -111,6 +111,7 @@ type ControlPlane struct {
 	routingKernspaceSnapshot       *routingKernspaceSnapshot
 	pendingDnsReloadCache          map[string]*DnsCache
 	sharedBpfReload                bool
+	dnsRoutingUnchanged            bool
 	closeOnce                      sync.Once
 	closeErr                       error
 }
