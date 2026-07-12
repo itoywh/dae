@@ -834,14 +834,13 @@ func newControlPlaneWithContextOptions(
 		// (e.g. missing clsact qdisc, interface disappeared) would otherwise
 		// cause traffic to bypass the proxy with no error. Missing LAN/WAN
 		// filters are auto re-attached (self-heal); a missing dae0 aborts.
-		if missing, fatal := core.repairDatapathBindings(); len(missing) > 0 {
-			msg := fmt.Sprintf("datapath validation failed after interface binding (self-heal could not recover): %v", missing)
-			if fatal {
-				return nil, fmt.Errorf("%s", msg)
-			}
-			core.log.Warnf("%s", msg)
+		if missing, fatal := core.repairDatapathBindings(); fatal {
+			return nil, fmt.Errorf("datapath validation failed after interface binding (self-heal could not recover): %v", missing)
 		}
 		if plane.sharedBpfReload && !plane.dnsRoutingUnchanged {
+			// NOTE (O5 review): bounded window where the shared domain_routing map
+			// is empty until replayDnsReloadCache() below repopulates it. Inherent
+			// to non-staged reload; skipped when dnsRoutingUnchanged is true.
 			if err = clearReloadDomainRoutingMap(core.bpf.Load()); err != nil {
 				return nil, fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
 			}
@@ -902,6 +901,12 @@ func ParseGroupOverrideOption(group config.Group, global config.Global, log *log
 // Scheme3 (Embedded Design): Connection-state maps are preserved across in-process
 // reload by handing the live BPF objects to the new control plane. Do NOT clear
 // them here, otherwise established flows may lose cached state and get rerouted.
+//
+// Window note (O5 review): this wipes the SHARED domain_routing BPF map. Between
+// this call and the subsequent replayDnsReloadCache() (which repopulates it from
+// the reloaded config), in-flight DNS lookups may briefly miss the map. The window
+// is bounded and inherent to non-staged reload; it is skipped entirely when
+// dnsRoutingUnchanged is true (DNS config unchanged across the reload).
 func clearReloadDomainRoutingMap(bpf *bpfObjects) error {
 	return BpfMapBatchDeleteAll[[4]uint32, bpfDomainRouting](bpf.DomainRoutingMap)
 }
@@ -1508,12 +1513,8 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 	// bindLan/bindWan/bindDaens that would otherwise cause traffic to bypass
 	// the proxy with no error logged. Missing LAN/WAN filters are auto
 	// re-attached (self-heal); a missing dae0 aborts.
-	if missing, fatal := c.core.repairDatapathBindings(); len(missing) > 0 {
-		msg := fmt.Sprintf("datapath validation failed after interface binding (self-heal could not recover): %v", missing)
-		if fatal {
-			return fmt.Errorf("%s", msg)
-		}
-		c.log.Warnf("%s", msg)
+	if missing, fatal := c.core.repairDatapathBindings(); fatal {
+		return fmt.Errorf("datapath validation failed after interface binding (self-heal could not recover): %v", missing)
 	}
 	if c.routingKernspaceSnapshot != nil {
 		c.log.Infoln("Loading routing rules into kernel space (BPF)...")
@@ -1524,6 +1525,8 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 		c.core.lpmTrieIndices = lpmIndices
 	}
 	if c.sharedBpfReload {
+		// NOTE (O5 review): see clearReloadDomainRoutingMap doc — bounded empty-map
+		// window until the replayDnsReloadCache() call below repopulates it.
 		if err := clearReloadDomainRoutingMap(c.core.bpf.Load()); err != nil {
 			return fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
 		}
@@ -1546,6 +1549,8 @@ func (c *ControlPlane) RebuildReloadDatapath() error {
 		return fmt.Errorf("rebuild routing kernspace: %w", err)
 	}
 	c.ReplaceLpmIndices(lpmIndices)
+	// NOTE (O5 review): see clearReloadDomainRoutingMap doc for the bounded
+	// empty-map window until replayDnsReloadCache() below.
 	if err := clearReloadDomainRoutingMap(c.core.bpf.Load()); err != nil {
 		return fmt.Errorf("rebuild clearReloadDomainRoutingMap: %w", err)
 	}

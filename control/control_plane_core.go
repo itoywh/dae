@@ -1073,20 +1073,20 @@ func (c *controlPlaneCore) repairDatapathBindings() (stillMissing []string, fata
 	if len(bad) == 0 {
 		return nil, false
 	}
-	repaired := false
+	repairedCount := 0
 	for _, bi := range bad {
 		switch bi.label {
 		case "LAN":
 			if err := rebindLanFn(c, bi.name); err != nil {
 				c.log.Warnf("datapath self-heal: failed to re-bind LAN %s: %v", bi.name, err)
 			} else {
-				repaired = true
+				repairedCount++
 			}
 		case "WAN":
 			if err := rebindWanFn(c, bi.name); err != nil {
 				c.log.Warnf("datapath self-heal: failed to re-bind WAN %s: %v", bi.name, err)
 			} else {
-				repaired = true
+				repairedCount++
 			}
 		case "dae0peer":
 			// dae0peer lives in the dae netns and is created/controlled by dae,
@@ -1101,8 +1101,15 @@ func (c *controlPlaneCore) repairDatapathBindings() (stillMissing []string, fata
 		_, reason := c.checkBinding(bi)
 		stillMissing = append(stillMissing, reason)
 	}
-	if repaired && len(stillMissing) == 0 {
-		c.log.Debugf("datapath self-heal: re-attached missing LAN/WAN TC filters")
+	// Unified logging exit (O4 review note): success is promoted to Info with a
+	// recovered count; any remaining gaps are warned here ONCE so the callers
+	// don't duplicate the stillMissing warning.
+	if len(stillMissing) == 0 {
+		if repairedCount > 0 {
+			c.log.Infof("datapath self-heal: recovered %d missing TC filter(s)", repairedCount)
+		}
+	} else {
+		c.log.Warnf("datapath self-heal: %d filter(s) still missing after self-heal: %v", len(stillMissing), stillMissing)
 	}
 	return stillMissing, fatal
 }

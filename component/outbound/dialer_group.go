@@ -44,8 +44,13 @@ type DialerGroup struct {
 	hasUdpDnsCheck bool
 
 	// fixed_fallback retry state (protected by fixedFallbackMu)
-	fixedFallbackMu            sync.Mutex
-	fixedFallbackDeadSince     int64
+	fixedFallbackMu        sync.Mutex
+	fixedFallbackDeadSince int64
+	// fixedFallbackFirstDeadNano is set once when a fixed node is first detected
+	// dead and stays until recovery. It anchors the "elapsed since first death"
+	// metric in logs (fixedFallbackDeadSince is rewritten on every retry, so it
+	// cannot serve that purpose — see O1 review note).
+	fixedFallbackFirstDeadNano int64
 	fixedFallbackRetryCount    int64
 	fixedFallbackLastRetryNano int64
 	fixedFallbackDone          bool
@@ -129,7 +134,11 @@ func NewDialerGroup(
 				}
 				if group.fixedFallbackRunning.CompareAndSwap(false, true) {
 					group.fixedFallbackMu.Lock()
-					group.fixedFallbackDeadSince = time.Now().UnixNano()
+					detectionNano := time.Now().UnixNano()
+					group.fixedFallbackDeadSince = detectionNano
+					if group.fixedFallbackFirstDeadNano == 0 {
+						group.fixedFallbackFirstDeadNano = detectionNano
+					}
 					group.fixedFallbackRetryCount = 0
 					group.fixedFallbackMu.Unlock()
 					// Read the live policy at spawn time so a runtime
@@ -204,7 +213,11 @@ func (g *DialerGroup) SetSelectionPolicy(policy DialerSelectionPolicy) {
 					}
 					if g.fixedFallbackRunning.CompareAndSwap(false, true) {
 						g.fixedFallbackMu.Lock()
-						g.fixedFallbackDeadSince = time.Now().UnixNano()
+						detectionNano := time.Now().UnixNano()
+						g.fixedFallbackDeadSince = detectionNano
+						if g.fixedFallbackFirstDeadNano == 0 {
+							g.fixedFallbackFirstDeadNano = detectionNano
+						}
 						g.fixedFallbackRetryCount = 0
 						g.fixedFallbackMu.Unlock()
 						// Read the live policy at spawn time so a runtime
@@ -388,13 +401,20 @@ func (g *DialerGroup) logNoAlive(
 	}).Warn("no alive dialer for selection (rate-limited)")
 }
 
-// logFixedFallback records state transitions for the fixed_fallback policy.
-// Mark values: 0=alive/recovery, 1=dead_detected (retry 1),
-// >=10=retry step (retryCount = state - 10).
-// deadSinceNano is the fixedFallbackDeadSince value observed by the caller
-// under fixedFallbackMu; it must NOT be read here (this function may be
-// called while the mutex is already held, e.g. from runFixedFallbackRetry).
-func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *dialer.NetworkType, deadSinceNano int64) {
+// logFixedFallback records fixed_fallback state transitions (alive/dead/retry)
+// and, when a fallback target was selected, the chosen dialer. This is the
+// single logging entry point for the fixed_fallback policy (previously split
+// across logFixedFallback + logFixedFallbackDetail — see O2 review note).
+//
+// State marks: 0=alive/recovery, 1=dead_detected (retry 1), >=10=retry step
+// (retryCount = state - 10). Pass fallbackDialer != nil to also emit the
+// per-selection fallback-target line.
+//
+// firstDeadNano anchors the "elapsed since first death" metric; it is the
+// fixedFallbackFirstDeadNano value observed by the caller under fixedFallbackMu
+// and must NOT be read here (this function may be called while the mutex is
+// already held, e.g. from runFixedFallbackRetry).
+func (g *DialerGroup) logFixedFallback(state int64, fixed, fallbackDialer *dialer.Dialer, nt *dialer.NetworkType, latency time.Duration, firstDeadNano int64) {
 	if g.log == nil {
 		return
 	}
@@ -425,51 +445,49 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 			}).Warnln("Fixed dialer DEAD, retry 1")
 		}
 	case state >= 10:
-		// Retry: log the actual retry count (state - 10) with node name
-		// and elapsed time since first dead detection, inline.
+		// Retry: log the actual retry count (state - 10) and elapsed time
+		// since FIRST death detection. firstDeadNano is anchored once on first
+		// death and stays until recovery; fixedFallbackDeadSince is rewritten on
+		// every retry so it cannot measure "since first death" (see O1).
 		retryCount := state - 10
 		old := g.fixedFallbackLastLogMark.Swap(state)
 		if old != state {
-			elapsed := time.Since(time.Unix(0, deadSinceNano)).Seconds()
+			var elapsed float64
+			if firstDeadNano > 0 {
+				elapsed = time.Since(time.Unix(0, firstDeadNano)).Seconds()
+			}
 			g.log.WithFields(logrus.Fields{
 				"group":   g.Name,
 				"dialer":  nodeName,
 				"network": nt.String(),
-			}).Warnf("Fixed dialer retry %d (%s) @%.1fs", retryCount, nodeName, elapsed)
+			}).Warnf("Fixed dialer retry %d @%.1fs", retryCount, elapsed)
 		}
 	}
-}
 
-// logFixedFallbackDetail logs the actual fallback target after selection.
-// Rate-limited to once per 10 seconds to prevent log spam under high traffic.
-func (g *DialerGroup) logFixedFallbackDetail(fixed, fallbackDialer *dialer.Dialer, nt *dialer.NetworkType, latency time.Duration) {
-	if g.log == nil {
-		return
+	// Fallback-target detail line. Rate-limited to once per 10s to avoid spam
+	// under high traffic. Independent of the transition log above; pass
+	// fallbackDialer == nil to skip it (e.g. retry-step and recovery logs).
+	if fallbackDialer != nil {
+		now := time.Now().UnixNano()
+		last := g.fixedFallbackDetailLog.Load()
+		if now-last < 10*int64(time.Second) {
+			return
+		}
+		if !g.fixedFallbackDetailLog.CompareAndSwap(last, now) {
+			return
+		}
+		fallbackName := ""
+		if fallbackDialer != nil && fallbackDialer.Property() != nil {
+			fallbackName = fallbackDialer.Property().Name
+		}
+		g.log.WithFields(logrus.Fields{
+			"group":    g.Name,
+			"fixed":    nodeName,
+			"fallback": fallbackName,
+			"network":  nt.String(),
+			"latency":  latency.String(),
+		}).Warnln("Fixed dialer DEAD, fallback to", fallbackName)
 	}
-	// Rate limit: allow one log per 10 seconds.
-	now := time.Now().UnixNano()
-	last := g.fixedFallbackDetailLog.Load()
-	if now-last < 10*int64(time.Second) {
-		return
-	}
-	if !g.fixedFallbackDetailLog.CompareAndSwap(last, now) {
-		return
-	}
-	fixedName := ""
-	if fixed != nil && fixed.Property() != nil {
-		fixedName = fixed.Property().Name
-	}
-	fallbackName := ""
-	if fallbackDialer != nil && fallbackDialer.Property() != nil {
-		fallbackName = fallbackDialer.Property().Name
-	}
-	g.log.WithFields(logrus.Fields{
-		"group":    g.Name,
-		"fixed":    fixedName,
-		"fallback": fallbackName,
-		"network":  nt.String(),
-		"latency":  latency.String(),
-	}).Warnln("Fixed dialer DEAD, fallback to", fallbackName)
 }
 
 // Select is a backward-compatible wrapper for SelectWithExclusion.
@@ -567,12 +585,13 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				g.fixedFallbackMu.Lock()
 				wasDead := g.fixedFallbackDeadSince != 0
 				g.fixedFallbackDeadSince = 0
+				g.fixedFallbackFirstDeadNano = 0
 				g.fixedFallbackRetryCount = 0
 				g.fixedFallbackLastRetryNano = 0
 				g.fixedFallbackDone = false
 				g.fixedFallbackMu.Unlock()
 				if wasDead {
-					g.logFixedFallback(0, fixed, nt, 0)
+					g.logFixedFallback(0, fixed, nil, nt, 0, 0)
 				}
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
 				return fixed, 0, selected, nil
@@ -601,6 +620,9 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			if deadSinceNano == 0 {
 				// First Select() finding this node dead.
 				g.fixedFallbackDeadSince = nowNano
+				if g.fixedFallbackFirstDeadNano == 0 {
+					g.fixedFallbackFirstDeadNano = nowNano
+				}
 				g.fixedFallbackRetryCount = 0
 				g.fixedFallbackMu.Unlock()
 				logRetry1 = true
@@ -627,10 +649,11 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			case consts.DialerSelectionPolicy_Random:
 				d := a.GetRandExcluded(excluded)
 				if d != nil {
-					g.logFixedFallbackDetail(fixed, d, nt, 0)
+					state := int64(-1)
 					if logRetry1 {
-						g.logFixedFallback(1, fixed, nt, 0)
+						state = 1
 					}
+					g.logFixedFallback(state, fixed, d, nt, 0, 0)
 					selected := preferAlternateSelectionNetworkType(d, nt)
 					return d, 0, selected, nil
 				}
@@ -639,10 +662,11 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				consts.DialerSelectionPolicy_MinMovingAverageLatencies:
 				d, lat := a.GetMinLatency(excluded)
 				if d != nil {
-					g.logFixedFallbackDetail(fixed, d, nt, lat)
+					state := int64(-1)
 					if logRetry1 {
-						g.logFixedFallback(1, fixed, nt, 0)
+						state = 1
 					}
+					g.logFixedFallback(state, fixed, d, nt, lat, 0)
 					selected := preferAlternateSelectionNetworkType(d, nt)
 					return d, lat, selected, nil
 				}
@@ -862,6 +886,7 @@ func alternateNetworkType(networkType *dialer.NetworkType) *dialer.NetworkType {
 func (g *DialerGroup) resetFixedFallback() {
 	g.fixedFallbackMu.Lock()
 	g.fixedFallbackDeadSince = 0
+	g.fixedFallbackFirstDeadNano = 0
 	g.fixedFallbackRetryCount = 0
 	g.fixedFallbackLastRetryNano = 0
 	g.fixedFallbackDone = false
@@ -892,7 +917,11 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 	fixed.NotifyCheckDnsUdp()
 	g.fixedFallbackMu.Lock()
 	g.fixedFallbackRetryCount = 1
-	g.fixedFallbackDeadSince = time.Now().UnixNano()
+	detectionNano := time.Now().UnixNano()
+	g.fixedFallbackDeadSince = detectionNano
+	if g.fixedFallbackFirstDeadNano == 0 {
+		g.fixedFallbackFirstDeadNano = detectionNano
+	}
 	g.fixedFallbackMu.Unlock()
 
 	actualTimeout := policy.FixedFallbackTimeout
@@ -944,7 +973,7 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 		// g.fixedFallbackDeadSince is read here while fixedFallbackMu is held
 		// (locked region 889-913) and passed in to avoid a lock re-entrancy
 		// inside logFixedFallback.
-		g.logFixedFallback(10+g.fixedFallbackRetryCount, fixed, nt, g.fixedFallbackDeadSince)
+		g.logFixedFallback(10+g.fixedFallbackRetryCount, fixed, nil, nt, 0, g.fixedFallbackFirstDeadNano)
 
 		shouldFallback := g.fixedFallbackRetryCount >= int64(policy.FixedFallbackRetries)
 		if shouldFallback {
