@@ -1,0 +1,71 @@
+name: Custom Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        type: string
+        required: false
+        default: 'v2.0-custom'
+        description: 'Branch/tag/SHA to build'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      GOAMD64: v1
+      CGO_ENABLED: 0
+
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Get version
+        id: version
+        run: |
+          date=$(git log -1 --format="%cd" --date=short | sed s/-//g)
+          count=$(git rev-list --count HEAD)
+          commit=$(git rev-parse --short HEAD)
+          echo "version=v2.0.0-custom-${date}.r${count}.${commit}" >> $GITHUB_OUTPUT
+
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang-15 llvm-15
+
+      - name: Get project dependencies
+        run: |
+          git submodule update --init --recursive
+          GOMODCACHE="${PWD}"/go-mod go mod download -modcacherw
+          find ./go-mod/ -maxdepth 1 ! -name "cache" ! -name "go-mod" -exec rm -rf {} \;
+          sed -i 's/#export GOMODCACHE=$(PWD)\/go-mod/export GOMODCACHE=$(PWD)\/go-mod/' Makefile
+
+      - name: Build dae (linux-amd64)
+        run: |
+          mkdir -p ./build/
+          export GOFLAGS="-trimpath -modcacherw"
+          export GOEXPERIMENT="newinliner,simd,heapminimum512kib,randomizedheapbase64"
+          export OUTPUT=build/dae-linux-amd64
+          export VERSION=${{ steps.version.outputs.version }}
+          export CLANG=clang-15
+          export STRIP=llvm-strip-15
+          make
+          echo "Build complete. Version: $VERSION"
+          ./build/dae-linux-amd64 --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dae-linux-amd64
+          path: build/dae-linux-amd64
+          retention-days: 7
