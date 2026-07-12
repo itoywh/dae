@@ -509,13 +509,15 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		Name:         consts.AppName + "_lan_ingress",
 		DirectAction: true,
 	}
+	var lanIngressProg *ebpf.Program
 	if linkHdrLen > 0 {
-		filterIngress.Fd = bpf.TproxyLanIngressL2.FD()
+		lanIngressProg = bpf.TproxyLanIngressL2
 		filterIngress.Name += "_l2"
 	} else {
-		filterIngress.Fd = bpf.TproxyLanIngressL3.FD()
+		lanIngressProg = bpf.TproxyLanIngressL3
 		filterIngress.Name += "_l3"
 	}
+	filterIngress.Fd = lanIngressProg.FD()
 	// Remove and add.
 	// Best effort to remove old filter; it may not exist.
 	_ = netlink.FilterDel(filterIngress)
@@ -524,6 +526,14 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 	}
 	if err := netlink.FilterAdd(filterIngress); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
+	}
+	if c.isReload {
+		// Reload make-before-break: the new-flip filter is now attached and
+		// serving, so removing the retiring generation's opposite-flip filter
+		// here leaves no datapath gap. Doing it eagerly (instead of relying on
+		// the retiring core's async Close()) prevents the stale filter that
+		// otherwise black-holes traffic when that Close() is delayed or killed.
+		tryDeleteFlippedFilter(filterIngress)
 	}
 	detachFunc := func() error {
 		if err := netlink.FilterDel(filterIngress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
@@ -545,13 +555,15 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		Name:         consts.AppName + "_lan_egress",
 		DirectAction: true,
 	}
+	var lanEgressProg *ebpf.Program
 	if linkHdrLen > 0 {
-		filterEgress.Fd = bpf.TproxyLanEgressL2.FD()
+		lanEgressProg = bpf.TproxyLanEgressL2
 		filterEgress.Name += "_l2"
 	} else {
-		filterEgress.Fd = bpf.TproxyLanEgressL3.FD()
+		lanEgressProg = bpf.TproxyLanEgressL3
 		filterEgress.Name += "_l3"
 	}
+	filterEgress.Fd = lanEgressProg.FD()
 	// Remove and add.
 	// Best effort to remove old filter; it may not exist.
 	_ = netlink.FilterDel(filterEgress)
@@ -560,6 +572,10 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 	}
 	if err := netlink.FilterAdd(filterEgress); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
+	}
+	if c.isReload {
+		// Reload make-before-break (see the ingress filter above).
+		tryDeleteFlippedFilter(filterEgress)
 	}
 	egressDetachFunc := func() error {
 		if err := netlink.FilterDel(filterEgress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
@@ -571,9 +587,11 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 
 	// Record the binding only after both filters are attached, so a
 	// failure mid-bind does not leave a "claimed but absent" entry (M6).
+	// Each handle is paired with the program attached at it so the self-check
+	// can verify the filter still points at this generation's program.
 	c.recordBoundIface(ifname, "LAN",
-		netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)), // ingress
-		netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)), // egress
+		boundFilter{netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)), lanIngressProg}, // ingress
+		boundFilter{netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)), lanEgressProg},  // egress
 	)
 
 	return nil
@@ -730,13 +748,15 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		Name:         consts.AppName + "_wan_egress",
 		DirectAction: true,
 	}
+	var wanEgressProg *ebpf.Program
 	if linkHdrLen > 0 {
-		filterEgress.Fd = bpf.TproxyWanEgressL2.FD()
+		wanEgressProg = bpf.TproxyWanEgressL2
 		filterEgress.Name += "_l2"
 	} else {
-		filterEgress.Fd = bpf.TproxyWanEgressL3.FD()
+		wanEgressProg = bpf.TproxyWanEgressL3
 		filterEgress.Name += "_l3"
 	}
+	filterEgress.Fd = wanEgressProg.FD()
 	// Best effort to remove old filter; it may not exist.
 	_ = netlink.FilterDel(filterEgress)
 	if !c.isReload {
@@ -744,6 +764,10 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 	}
 	if err := netlink.FilterAdd(filterEgress); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
+	}
+	if c.isReload {
+		// Reload make-before-break (see _bindLan for the rationale).
+		tryDeleteFlippedFilter(filterEgress)
 	}
 	egressDetachFunc := func() error {
 		if err := netlink.FilterDel(filterEgress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
@@ -764,13 +788,15 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		Name:         consts.AppName + "_wan_ingress",
 		DirectAction: true,
 	}
+	var wanIngressProg *ebpf.Program
 	if linkHdrLen > 0 {
-		filterIngress.Fd = bpf.TproxyWanIngressL2.FD()
+		wanIngressProg = bpf.TproxyWanIngressL2
 		filterIngress.Name += "_l2"
 	} else {
-		filterIngress.Fd = bpf.TproxyWanIngressL3.FD()
+		wanIngressProg = bpf.TproxyWanIngressL3
 		filterIngress.Name += "_l3"
 	}
+	filterIngress.Fd = wanIngressProg.FD()
 	// Best effort to remove old filter; it may not exist.
 	_ = netlink.FilterDel(filterIngress)
 	if !c.isReload {
@@ -778,6 +804,10 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 	}
 	if err := netlink.FilterAdd(filterIngress); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
+	}
+	if c.isReload {
+		// Reload make-before-break (see _bindLan for the rationale).
+		tryDeleteFlippedFilter(filterIngress)
 	}
 	ingressDetachFunc := func() error {
 		if err := netlink.FilterDel(filterIngress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
@@ -787,10 +817,11 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 	}
 	c.addManagedBpfHookCleanup("wan-ingress", ingressDetachFunc)
 
-	// Record the binding only after both filters are attached (M6).
+	// Record the binding only after both filters are attached (M6). Each handle
+	// is paired with the program attached at it for the program-aware self-check.
 	c.recordBoundIface(ifname, "WAN",
-		netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)), // egress
-		netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)), // ingress
+		boundFilter{netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)), wanEgressProg},  // egress
+		boundFilter{netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)), wanIngressProg}, // ingress
 	)
 
 	return nil
@@ -829,9 +860,10 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 		}
 		return err
 	})
-	// Remove and add.
-	if !c.isReload {
-		// Clean up thoroughly: delete the filter with the flipped handle.
+	// Clean up thoroughly: delete the filter with the flipped (previous
+	// generation's) handle. Defined once so both the fresh-start and the reload
+	// make-before-break paths reuse it.
+	deleteFlippedDae0peer := func() {
 		filterIngressFlipped := deepcopy.Copy(filterDae0peerIngress).(*netlink.BpfFilter)
 		filterIngressFlipped.Handle ^= 1
 		daens.WithBestEffort("delete flipped dae0peer ingress filter", func() error {
@@ -842,6 +874,10 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 			return err
 		})
 	}
+	// Remove and add.
+	if !c.isReload {
+		deleteFlippedDae0peer()
+	}
 	if err = daens.WithRequired("add dae0peer ingress filter", func() error {
 		if err := netlink.FilterAdd(filterDae0peerIngress); err != nil && !errors.Is(err, unix.EEXIST) {
 			return err
@@ -849,6 +885,12 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 		return nil
 	}); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
+	}
+	if c.isReload {
+		// Reload make-before-break: the new-flip dae0peer filter is attached and
+		// serving, so remove the retiring generation's opposite-flip filter now
+		// rather than waiting for its async Close() (see _bindLan).
+		deleteFlippedDae0peer()
 	}
 	detachFunc := func() error {
 		return daens.WithRequired("delete dae0peer ingress filter", func() error {
@@ -864,7 +906,8 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	// netns; a missing dae0peer filter is a warning (non-fatal). Note: this is the
 	// opposite of dae0, whose missing filter is fatal (it aborts startup/reload).
 	// dae0peer only warns so the proxy keeps running.
-	c.recordBoundIface(daens.Dae0Peer().Attrs().Name, "dae0peer", netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)))
+	c.recordBoundIface(daens.Dae0Peer().Attrs().Name, "dae0peer",
+		boundFilter{netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)), bpf.TproxyDae0peerIngress})
 
 	// tproxy_dae0_ingress@dae0 at host netns
 	// Best effort to add qdisc; it may already exist.
@@ -890,7 +933,14 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	if err := netlink.FilterAdd(filterDae0Ingress); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
-	c.recordBoundIface(daens.Dae0().Attrs().Name, "dae0", netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)))
+	if c.isReload {
+		// Reload make-before-break (see _bindLan for the rationale). dae0 is the
+		// host-side veth dae itself owns; clearing its stale opposite-flip filter
+		// eagerly is what prevents the reload black-hole on veth/netkit.
+		tryDeleteFlippedFilter(filterDae0Ingress)
+	}
+	c.recordBoundIface(daens.Dae0().Attrs().Name, "dae0",
+		boundFilter{netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)), bpf.TproxyDae0Ingress})
 	dae0DetachFunc := func() error {
 		if err := netlink.FilterDel(filterDae0Ingress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
 			return fmt.Errorf("FilterDel(%v:%v): %w", daens.Dae0().Attrs().Name, filterDae0Ingress.Name, err)
@@ -901,16 +951,29 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	return
 }
 
+// boundFilter pairs a TC filter handle with the BPF program that is expected to
+// be attached at that handle. Validation checks not merely that *a* filter
+// exists at the handle, but that it points at this generation's program, which
+// catches the stale/zombie filter case: a leftover handle from a previous
+// generation whose backing program is no longer valid (a reload black-hole).
+// prog may be nil (e.g. in unit tests), in which case validation falls back to
+// a handle-only presence check.
+type boundFilter struct {
+	handle uint32
+	prog   *ebpf.Program
+}
+
 // boundIface is an interface that was successfully bound, paired with the full
-// TC filter handle(s) and a human-readable label, so validateDatapathBindings
-// can confirm the corresponding filter(s) are actually attached. LAN/WAN carry
-// two filters (ingress + egress) under the same major but different minor, so
-// handles is a slice: every listed handle must be present for the binding to be
-// considered healthy.
+// TC filter(s) and a human-readable label, so validateDatapathBindings can
+// confirm the corresponding filter(s) are actually attached. LAN/WAN carry two
+// filters (ingress + egress) under the same major but different minor — and,
+// importantly, backed by *different* programs — so filters is a slice: every
+// listed filter must be present (and, when its program is known, point at that
+// program) for the binding to be considered healthy.
 type boundIface struct {
 	name    string
 	label   string
-	handles []uint32
+	filters []boundFilter
 }
 
 // linkByName looks up a network interface by name. It is a package-level
@@ -919,27 +982,27 @@ var linkByName = netlink.LinkByName
 
 // recordBoundIface records a successfully bound interface so that a later
 // validateDatapathBindings call can confirm its TC filter(s) are attached.
-// Duplicate (name+label+handles) entries are ignored, which keeps the recorded
+// Duplicate (name+label+filters) entries are ignored, which keeps the recorded
 // set stable when an interface is re-bound during self-heal.
-func (c *controlPlaneCore) recordBoundIface(name, label string, handles ...uint32) {
+func (c *controlPlaneCore) recordBoundIface(name, label string, filters ...boundFilter) {
 	c.datapathMu.Lock()
 	defer c.datapathMu.Unlock()
 	for _, b := range c.datapathIfaces {
-		if b.name == name && b.label == label && equalHandles(b.handles, handles) {
+		if b.name == name && b.label == label && equalBoundFilters(b.filters, filters) {
 			return
 		}
 	}
-	c.datapathIfaces = append(c.datapathIfaces, boundIface{name: name, label: label, handles: handles})
+	c.datapathIfaces = append(c.datapathIfaces, boundIface{name: name, label: label, filters: filters})
 }
 
-// equalHandles reports whether two TC handle slices contain the same handles in
-// the same order.
-func equalHandles(a, b []uint32) bool {
+// equalBoundFilters reports whether two boundFilter slices contain the same
+// (handle, prog) pairs in the same order.
+func equalBoundFilters(a, b []boundFilter) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if a[i] != b[i] {
+		if a[i].handle != b[i].handle || a[i].prog != b[i].prog {
 			return false
 		}
 	}
@@ -989,9 +1052,9 @@ func (c *controlPlaneCore) checkBindingInNetns(bi boundIface) (ok bool, reason s
 	if bi.label == "dae0" || bi.label == "dae0peer" {
 		parents = []uint32{netlink.HANDLE_MIN_INGRESS}
 	}
-	for _, h := range bi.handles {
-		if !hasDaeTcFilter(link, h, parents) {
-			return false, fmt.Sprintf("%s (%s, handle 0x%x missing)", bi.name, bi.label, h)
+	for _, bf := range bi.filters {
+		if !hasDaeTcFilter(link, bf.handle, parents, bf.prog) {
+			return false, fmt.Sprintf("%s (%s, handle 0x%x missing)", bi.name, bi.label, bf.handle)
 		}
 	}
 	return true, ""
@@ -1126,29 +1189,83 @@ func (c *controlPlaneCore) repairDatapathBindings() (stillMissing []string, fata
 // in a mock without touching the real netlink stack.
 var filterLister = netlink.FilterList
 
-// hasDaeTcFilter reports whether a TC filter with the exact given full handle
-// (major<<16 | minor, e.g. 0x20220002 for dae0, 0x20230004/0x20230002 for the
-// LAN/WAN ingress/egress pair) is attached on link within the given parents.
-// Comparing the full handle (not just the major) lets validateDatapathBindings
-// distinguish the two filters LAN/WAN carry under the same major.
+// hasDaeTcFilter reports whether a healthy TC filter with the exact given full
+// handle (major<<16 | minor, e.g. 0x20220002 for dae0, 0x20230004/0x20230002
+// for the LAN/WAN ingress/egress pair) is attached on link within the given
+// parents. Comparing the full handle (not just the major) lets
+// validateDatapathBindings distinguish the two filters LAN/WAN carry under the
+// same major.
+//
+// When expectProg is non-nil and its kernel program id can be resolved, the
+// filter at the matching handle must also point at that program id. This is the
+// program-aware self-check: after a reload, a TC filter handle can survive while
+// the program it references becomes stale/invalid (the veth/netkit reload
+// black-hole), leaving a "handle present but datapath dead" zombie. Counting the
+// handle alone would report such a binding as healthy; verifying the program id
+// catches it so repairDatapathBindings can re-attach. If the id cannot be
+// resolved (expectProg nil, Info() error, or the kernel not reporting
+// TCA_BPF_ID) it degrades gracefully to a handle-only presence check, so it
+// never regresses below the previous behaviour.
 //
 // parents scopes the netlink enumeration: dae0/dae0peer carry only an ingress
 // filter, so callers pass [HANDLE_MIN_INGRESS] for them; LAN/WAN carry both an
 // ingress and an egress filter, so callers pass both. This avoids one wasted
 // FilterList call per binding on interfaces that never have an egress filter.
-func hasDaeTcFilter(link netlink.Link, handle uint32, parents []uint32) bool {
+func hasDaeTcFilter(link netlink.Link, handle uint32, parents []uint32, expectProg *ebpf.Program) bool {
+	expectID, haveID := expectedProgID(expectProg)
 	for _, parent := range parents {
 		filters, err := filterLister(link, parent)
 		if err != nil {
 			continue // no clsact qdisc attached
 		}
 		for _, f := range filters {
-			if f.Attrs().Handle == handle {
+			if f.Attrs().Handle != handle {
+				continue
+			}
+			if !haveID {
+				// Cannot verify program identity; a matching handle is
+				// sufficient (previous behaviour).
 				return true
 			}
+			bf, ok := f.(*netlink.BpfFilter)
+			if !ok {
+				// Not a bpf filter (e.g. a mocked GenericFilter in tests, or an
+				// unexpected filter type); do not second-guess a handle match.
+				return true
+			}
+			if bf.Id == 0 {
+				// Kernel did not report the program id for this filter; fall
+				// back to a handle-only match rather than false-alarming.
+				return true
+			}
+			if bf.Id == expectID {
+				return true // handle and program id both match: healthy
+			}
+			// A filter exists at this handle but points at a different (stale)
+			// program. Handles are unique per parent, so keep scanning the other
+			// parent (if any) rather than accepting this zombie.
 		}
 	}
 	return false
+}
+
+// expectedProgID resolves the kernel program id of prog, returning ok=false if
+// it cannot be determined (nil program, Info() error, or an id the kernel does
+// not expose). Callers treat ok=false as "unverifiable" and fall back to a
+// handle-only check.
+func expectedProgID(prog *ebpf.Program) (id int, ok bool) {
+	if prog == nil {
+		return 0, false
+	}
+	info, err := prog.Info()
+	if err != nil {
+		return 0, false
+	}
+	pid, exposed := info.ID()
+	if !exposed {
+		return 0, false
+	}
+	return int(pid), true
 }
 
 // tryDeleteFlippedFilter deletes the TC filter obtained by flipping the

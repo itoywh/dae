@@ -37,6 +37,17 @@ const (
 	lanEgrHandle = 0x2023<<16 | 0b010 // 0x20230002
 )
 
+// bf builds a boundFilter list from the given handles with nil programs, so the
+// self-check falls back to handle-only presence (the behaviour these tests
+// assert). Program-id validation is exercised separately in TestHasDaeTcFilter.
+func bf(handles ...uint32) []boundFilter {
+	fs := make([]boundFilter, 0, len(handles))
+	for _, h := range handles {
+		fs = append(fs, boundFilter{handle: h})
+	}
+	return fs
+}
+
 func TestValidateDatapathBindings(t *testing.T) {
 	// Swap out the kernel-touching helpers for mocks.
 	origLinkByName := linkByName
@@ -62,14 +73,14 @@ func TestValidateDatapathBindings(t *testing.T) {
 			name:      "all bindings present",
 			known:     map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
 			filters:   map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle), "eth0": mkFilters(lanIngHandle, lanEgrHandle)},
-			bound:     []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			bound:     []boundIface{{"dae0", "dae0", bf(dae0Handle)}, {"eth0", "LAN", bf(lanIngHandle, lanEgrHandle)}},
 			wantEmpty: true,
 		},
 		{
 			name:         "dae0 filter missing (fatal)",
 			known:        map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
 			filters:      map[string][]netlink.Filter{"eth0": mkFilters(lanIngHandle, lanEgrHandle)},
-			bound:        []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			bound:        []boundIface{{"dae0", "dae0", bf(dae0Handle)}, {"eth0", "LAN", bf(lanIngHandle, lanEgrHandle)}},
 			wantEmpty:    false,
 			wantContains: []string{"dae0 (dae0, handle 0x20220002 missing)"},
 		},
@@ -77,7 +88,7 @@ func TestValidateDatapathBindings(t *testing.T) {
 			name:         "lan filter missing (warn only)",
 			known:        map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
 			filters:      map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle)},
-			bound:        []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			bound:        []boundIface{{"dae0", "dae0", bf(dae0Handle)}, {"eth0", "LAN", bf(lanIngHandle, lanEgrHandle)}},
 			wantEmpty:    false,
 			wantContains: []string{"eth0 (LAN, handle 0x20230004 missing)"},
 		},
@@ -85,7 +96,7 @@ func TestValidateDatapathBindings(t *testing.T) {
 			name:         "lan egress filter missing (partial, double-filter)",
 			known:        map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
 			filters:      map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle), "eth0": mkFilters(lanIngHandle)},
-			bound:        []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			bound:        []boundIface{{"dae0", "dae0", bf(dae0Handle)}, {"eth0", "LAN", bf(lanIngHandle, lanEgrHandle)}},
 			wantEmpty:    false,
 			wantContains: []string{"eth0 (LAN, handle 0x20230002 missing)"},
 		},
@@ -93,7 +104,7 @@ func TestValidateDatapathBindings(t *testing.T) {
 			name:         "wan filter missing (warn only)",
 			known:        map[string]netlink.Link{"dae0": dae0, "eth1": eth1},
 			filters:      map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle)},
-			bound:        []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth1", "WAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			bound:        []boundIface{{"dae0", "dae0", bf(dae0Handle)}, {"eth1", "WAN", bf(lanIngHandle, lanEgrHandle)}},
 			wantEmpty:    false,
 			wantContains: []string{"eth1 (WAN, handle 0x20230004 missing)"},
 		},
@@ -101,7 +112,7 @@ func TestValidateDatapathBindings(t *testing.T) {
 			name:         "interface not found",
 			known:        map[string]netlink.Link{"dae0": dae0},
 			filters:      map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle)},
-			bound:        []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			bound:        []boundIface{{"dae0", "dae0", bf(dae0Handle)}, {"eth0", "LAN", bf(lanIngHandle, lanEgrHandle)}},
 			wantEmpty:    false,
 			wantContains: []string{"eth0 (LAN, link not found)"},
 		},
@@ -192,7 +203,7 @@ func TestRepairDatapathBindings(t *testing.T) {
 			name:             "LAN missing then self-healed",
 			known:            map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
 			filters:          map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle)},
-			bound:            []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			bound:            []boundIface{{"dae0", "dae0", bf(dae0Handle)}, {"eth0", "LAN", bf(lanIngHandle, lanEgrHandle)}},
 			lanRebindFixes:   true,
 			wantStillMissing: nil,
 			wantFatal:        false,
@@ -201,7 +212,7 @@ func TestRepairDatapathBindings(t *testing.T) {
 			name:             "WAN missing but rebind fails (warn only)",
 			known:            map[string]netlink.Link{"dae0": dae0, "eth1": eth1},
 			filters:          map[string][]netlink.Filter{"dae0": mkFilters(dae0Handle)},
-			bound:            []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth1", "WAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			bound:            []boundIface{{"dae0", "dae0", bf(dae0Handle)}, {"eth1", "WAN", bf(lanIngHandle, lanEgrHandle)}},
 			wanRebindErr:     fmt.Errorf("simulated clsact unavailable"),
 			wantStillMissing: []string{"eth1 (WAN, handle 0x20230004 missing)"},
 			wantFatal:        false,
@@ -210,7 +221,7 @@ func TestRepairDatapathBindings(t *testing.T) {
 			name:             "dae0 missing is fatal and not self-healed",
 			known:            map[string]netlink.Link{"dae0": dae0, "eth0": eth0},
 			filters:          map[string][]netlink.Filter{"eth0": mkFilters(lanIngHandle, lanEgrHandle)},
-			bound:            []boundIface{{"dae0", "dae0", []uint32{dae0Handle}}, {"eth0", "LAN", []uint32{lanIngHandle, lanEgrHandle}}},
+			bound:            []boundIface{{"dae0", "dae0", bf(dae0Handle)}, {"eth0", "LAN", bf(lanIngHandle, lanEgrHandle)}},
 			wantStillMissing: []string{"dae0 (dae0, handle 0x20220002 missing)"},
 			wantFatal:        true,
 		},
@@ -313,7 +324,10 @@ func TestHasDaeTcFilter(t *testing.T) {
 			filterLister = func(link netlink.Link, parent uint32) ([]netlink.Filter, error) {
 				return tt.filters, nil
 			}
-			if got := hasDaeTcFilter(link, tt.handle); got != tt.want {
+			parents := []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS}
+			// nil expectProg => handle-only presence check (program-id
+			// validation requires a live BPF program and is covered on-device).
+			if got := hasDaeTcFilter(link, tt.handle, parents, nil); got != tt.want {
 				t.Errorf("hasDaeTcFilter(%#x) = %v, want %v", tt.handle, got, tt.want)
 			}
 		})
