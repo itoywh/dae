@@ -905,7 +905,7 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 	if policy.FixedFallbackRetries <= 0 {
 		g.fixedFallbackMu.Lock()
 		g.fixedFallbackDone = true
-		g.fixedFallbackDeadSince = time.Now().UnixNano() - 1
+		g.fixedFallbackDeadSince = time.Now().UnixNano()
 		g.fixedFallbackMu.Unlock()
 		return
 	}
@@ -958,7 +958,7 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 		g.fixedFallbackMu.Lock()
 		if g.fixedFallbackRetryCount >= int64(policy.FixedFallbackRetries) {
 			g.fixedFallbackDone = true
-			g.fixedFallbackDeadSince = time.Now().UnixNano() - 1
+			g.fixedFallbackDeadSince = time.Now().UnixNano()
 			g.fixedFallbackMu.Unlock()
 			return
 		}
@@ -978,7 +978,7 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 		shouldFallback := g.fixedFallbackRetryCount >= int64(policy.FixedFallbackRetries)
 		if shouldFallback {
 			g.fixedFallbackDone = true
-			g.fixedFallbackDeadSince = time.Now().UnixNano() - 1
+			g.fixedFallbackDeadSince = time.Now().UnixNano()
 		} else {
 			g.fixedFallbackDeadSince = time.Now().UnixNano()
 		}

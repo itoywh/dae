@@ -1104,16 +1104,7 @@ func (d *Dialer) markUnavailableInternal(typ *NetworkType, force bool, isTraffic
 	if wasAlive != alive {
 		d.notifyAliveTransition(typ, alive)
 		// Log alive→dead transitions for operational visibility.
-		if !alive && d.Log != nil {
-			nodeName := ""
-			if d.property != nil {
-				nodeName = d.property.Name
-			}
-			d.Log.WithFields(logrus.Fields{
-				"dialer":  nodeName,
-				"network": typ.String(),
-			}).Warnln("Node became DEAD")
-		}
+		d.logAliveTransition(typ, alive, 0, false)
 	}
 
 	// Notify sticky IP dialer and recovery detection ONLY when truly transitioning to dead.
@@ -1155,17 +1146,7 @@ func (d *Dialer) markAvailable(typ *NetworkType, latency time.Duration) (collect
 	if isRevival {
 		d.notifyAliveTransition(typ, true)
 		// Log dead→alive transitions for operational visibility.
-		if d.Log != nil {
-			nodeName := ""
-			if d.property != nil {
-				nodeName = d.property.Name
-			}
-			d.Log.WithFields(logrus.Fields{
-				"dialer":  nodeName,
-				"network": typ.String(),
-				"latency": latency.String(),
-			}).Infoln("Node became ALIVE")
-		}
+		d.logAliveTransition(typ, true, latency, false)
 	}
 
 	return update, avg
@@ -1191,18 +1172,38 @@ func (d *Dialer) markAvailableTraffic(typ *NetworkType) collectionUpdate {
 	if isRevival {
 		d.notifyAliveTransition(typ, true)
 		// Log dead→alive transitions for operational visibility.
-		if d.Log != nil {
-			nodeName := ""
-			if d.property != nil {
-				nodeName = d.property.Name
-			}
-			d.Log.WithFields(logrus.Fields{
-				"dialer":  nodeName,
-				"network": typ.String(),
-			}).Infoln("Node became ALIVE (traffic)")
-		}
+		d.logAliveTransition(typ, true, 0, true)
 	}
 	return update
+}
+
+// logAliveTransition emits an operational-visibility log line when a dialer's
+// alive state flips. It centralises the three near-identical "Node became
+// DEAD / ALIVE / ALIVE (traffic)" blocks that previously duplicated the
+// nodeName lookup and field construction.
+func (d *Dialer) logAliveTransition(typ *NetworkType, alive bool, latency time.Duration, traffic bool) {
+	if d.Log == nil {
+		return
+	}
+	nodeName := ""
+	if d.property != nil {
+		nodeName = d.property.Name
+	}
+	fields := logrus.Fields{
+		"dialer":  nodeName,
+		"network": typ.String(),
+	}
+	if alive && !traffic {
+		fields["latency"] = latency.String()
+	}
+	switch {
+	case !alive:
+		d.Log.WithFields(fields).Warnln("Node became DEAD")
+	case traffic:
+		d.Log.WithFields(fields).Infoln("Node became ALIVE (traffic)")
+	default:
+		d.Log.WithFields(fields).Infoln("Node became ALIVE")
+	}
 }
 
 func (d *Dialer) informDialerGroupUpdate(update collectionUpdate) {

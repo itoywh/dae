@@ -85,6 +85,28 @@ routing {
 	require.EqualValues(t, 262144, conf.Global.BpfConnStateMapSize)
 }
 
+// TestGlobalHealthCheckFieldsOptInByDefault guards the opt-in health-check
+// design: tcp_check_url / udp_check_dns / check_interval carry no `default:`
+// tag in config.go, so omitting them leaves them at their zero value. If
+// someone re-introduces upstream-style defaults that auto-enable checks, this
+// test fails and surfaces the regression instead of silently forcing health
+// checks on for every node.
+func TestGlobalHealthCheckFieldsOptInByDefault(t *testing.T) {
+	sections, err := config_parser.Parse(`
+global {}
+routing {
+  fallback: direct
+}
+`)
+	require.NoError(t, err)
+
+	conf, err := New(sections)
+	require.NoError(t, err)
+	require.Empty(t, conf.Global.TcpCheckUrl, "tcp_check_url must default to empty (opt-in)")
+	require.Empty(t, conf.Global.UdpCheckDns, "udp_check_dns must default to empty (opt-in)")
+	require.Zero(t, conf.Global.CheckInterval, "check_interval must default to zero (opt-in)")
+}
+
 func TestDecodeConfigSectionRejectsUnknownSection(t *testing.T) {
 	conf := &Config{}
 	err := decodeConfigSection(conf, "unknown", &config_parser.Section{Name: "unknown"})

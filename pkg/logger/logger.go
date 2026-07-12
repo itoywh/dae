@@ -34,8 +34,10 @@ type cstFormatter struct {
 
 // Format overrides the timestamp formatting to use CST timezone.
 func (f *cstFormatter) Format(entry *logrus.Entry) ([]byte, error) {
-	// Create a copy of the entry to avoid modifying the shared entry object
-	if !f.DisableTimestamp && entry.Time != (time.Time{}) {
+	// Create a copy of the entry to avoid modifying the shared entry object.
+	// entry.Time is always populated by logrus before Format is called, so the
+	// previous `entry.Time != (time.Time{})` guard was always true.
+	if !f.DisableTimestamp {
 		modifiedEntry := *entry
 		modifiedEntry.Time = entry.Time.In(cstLocation)
 		return f.TextFormatter.Format(&modifiedEntry)

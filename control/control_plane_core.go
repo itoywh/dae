@@ -861,8 +861,9 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	c.addManagedBpfHookCleanup("dae0peer-ingress", detachFunc)
 	// Record the dae0peer binding (in the dae netns) so validateDatapathBindings
 	// can confirm its TC filter survived a reload. It is checked inside the dae
-	// netns; a missing dae0peer filter is a warning (non-fatal), mirroring dae0's
-	// self-heal policy without aborting the proxy.
+	// netns; a missing dae0peer filter is a warning (non-fatal). Note: this is the
+	// opposite of dae0, whose missing filter is fatal (it aborts startup/reload).
+	// dae0peer only warns so the proxy keeps running.
 	c.recordBoundIface(daens.Dae0Peer().Attrs().Name, "dae0peer", netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)))
 
 	// tproxy_dae0_ingress@dae0 at host netns
@@ -982,8 +983,14 @@ func (c *controlPlaneCore) checkBindingInNetns(bi boundIface) (ok bool, reason s
 	if err != nil {
 		return false, fmt.Sprintf("%s (%s, link not found)", bi.name, bi.label)
 	}
+	// dae0/dae0peer attach only an ingress filter; LAN/WAN attach both ingress
+	// and egress. Scope the enumeration accordingly to skip a wasted FilterList.
+	parents := []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS}
+	if bi.label == "dae0" || bi.label == "dae0peer" {
+		parents = []uint32{netlink.HANDLE_MIN_INGRESS}
+	}
 	for _, h := range bi.handles {
-		if !hasDaeTcFilter(link, h) {
+		if !hasDaeTcFilter(link, h, parents) {
 			return false, fmt.Sprintf("%s (%s, handle 0x%x missing)", bi.name, bi.label, h)
 		}
 	}
@@ -1121,12 +1128,16 @@ var filterLister = netlink.FilterList
 
 // hasDaeTcFilter reports whether a TC filter with the exact given full handle
 // (major<<16 | minor, e.g. 0x20220002 for dae0, 0x20230004/0x20230002 for the
-// LAN/WAN ingress/egress pair) is attached on link in either the ingress or
-// egress parent. Comparing the full handle (not just the major) lets
-// validateDatapathBindings distinguish the two filters LAN/WAN carry under the
-// same major.
-func hasDaeTcFilter(link netlink.Link, handle uint32) bool {
-	for _, parent := range []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS} {
+// LAN/WAN ingress/egress pair) is attached on link within the given parents.
+// Comparing the full handle (not just the major) lets validateDatapathBindings
+// distinguish the two filters LAN/WAN carry under the same major.
+//
+// parents scopes the netlink enumeration: dae0/dae0peer carry only an ingress
+// filter, so callers pass [HANDLE_MIN_INGRESS] for them; LAN/WAN carry both an
+// ingress and an egress filter, so callers pass both. This avoids one wasted
+// FilterList call per binding on interfaces that never have an egress filter.
+func hasDaeTcFilter(link netlink.Link, handle uint32, parents []uint32) bool {
+	for _, parent := range parents {
 		filters, err := filterLister(link, parent)
 		if err != nil {
 			continue // no clsact qdisc attached
