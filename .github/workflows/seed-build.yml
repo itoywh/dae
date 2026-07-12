@@ -24,13 +24,6 @@ on:
       build-type:
         type: string
         description: "[pr-build,main-build,daily-build,release-build]"
-  workflow_dispatch:
-    inputs:
-      ref:
-        type: string
-        required: false
-        default: 'v2.0-custom'
-        description: 'Branch/tag/SHA to build'
 
 jobs:
   build:
