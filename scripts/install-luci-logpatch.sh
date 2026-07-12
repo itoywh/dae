@@ -1,7 +1,7 @@
 #!/bin/sh
 # luci-app-dae 日志页增强安装脚本
 # 仅注入「清除日志」按钮（最小化 patch，不改动上游其他代码）
-# 版本: v1.0.0
+# 版本: v1.1.0
 # 固定托管(Gist): https://gist.github.com/itoywh/3778f690647ea1636e892b003a630eae
 # 用法: curl -sL https://gist.githubusercontent.com/itoywh/3778f690647ea1636e892b003a630eae/raw/install-luci-logpatch.sh | sh
 #
@@ -72,10 +72,27 @@ else
         echo "⚠️  ACL 已包含 dae.log 写权限，跳过"
     else
         # 在 write.file 段的最后一个条目后追加日志写权限
-        # 匹配 "/etc/dae/config.dae": [ "write" ] 这行，在其后插入
-        sed -i '\|"/etc/dae/config.dae".*"write"|a\
+        # 匹配 "/etc/dae/config.dae": [ "write" ] 这行：
+        #   ① 给匹配行补尾逗号（JSON 对象条目间需逗号分隔）
+        #   ② 在其后插入 dae.log 写权限条目
+        # 注意：sed 地址范围 '{...}' 内 s/a/a\ 命令顺序执行
+        sed -i '\|"/etc/dae/config.dae".*"write"|{
+            # 确保该行以逗号结尾（幂等：已有逗号则不重复追加）
+            /,$/!s/$/,/
+            # 在该行后插入新条目
+            a\
 \t\t\t\t"/var/log/dae/dae.log": [ "write" ]
-' "$ACL_JSON"
+        }' "$ACL_JSON"
+
+        # 校验 JSON 合法性；失败则回滚备份并报错
+        if command -v jsonfilter >/dev/null 2>&1; then
+            if ! jsonfilter -i "$ACL_JSON" >/dev/null 2>&1; then
+                echo "❌ 错误: $ACL_JSON 注入后 JSON 非法，正在回滚..."
+                cp /tmp/luci-app-dae-acl.bak "$ACL_JSON"
+                echo "已从备份恢复原始文件。请检查上游 ACL 格式是否发生变化"
+                exit 1
+            fi
+        fi
 
         /etc/init.d/rpcd reload 2>/dev/null || true
         echo "✅ ACL：已添加 dae.log 写权限并重载 rpcd"
