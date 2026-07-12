@@ -8,6 +8,12 @@ on:
         type: string
         required: true
 
+# 在 fork 上 GITHUB_TOKEN 默认只有 contents: read，导致 upload-release 阶段
+# 调用 softprops/action-gh-release 创建/上传 Release 时 403。
+# 显式声明 contents: write 提升 token 权限，使发布全流程可全自动完成。
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
