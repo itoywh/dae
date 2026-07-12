@@ -1328,7 +1328,7 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 			d.Log.WithFields(fields).Debugln("Connectivity Check")
 		}
 		d.informDialerGroupUpdate(update)
-	} else if err != nil && !stderrors.Is(err, context.Canceled) {
+	} else if err != nil && !stderrors.Is(err, context.Canceled) && !stderrors.Is(err, ErrNoApplicableIP) {
 		d.collectionFineMu.Lock()
 		collection := d.mustGetCollection(opts.networkType)
 		collection.LastProbe = DialerProbeObservationSnapshot{

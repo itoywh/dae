@@ -128,7 +128,10 @@ func NewDialerGroup(
 					group.fixedFallbackDeadSince = time.Now().UnixNano()
 					group.fixedFallbackRetryCount = 0
 					group.fixedFallbackMu.Unlock()
-					go group.runFixedFallbackRetry(fixed, p, nt)
+					// Read the live policy at spawn time so a runtime
+					// SetSelectionPolicy change is picked up, instead of
+					// the p captured by this closure (stale after reload).
+					go group.runFixedFallbackRetry(fixed, group.currentSelectionState().policy, nt)
 				}
 			})
 		}
@@ -357,7 +360,10 @@ func (g *DialerGroup) logNoAlive(
 // logFixedFallback records state transitions for the fixed_fallback policy.
 // Mark values: 0=alive/recovery, 1=dead_detected (retry 1),
 // >=10=retry step (retryCount = state - 10).
-func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *dialer.NetworkType) {
+// deadSinceNano is the fixedFallbackDeadSince value observed by the caller
+// under fixedFallbackMu; it must NOT be read here (this function may be
+// called while the mutex is already held, e.g. from runFixedFallbackRetry).
+func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *dialer.NetworkType, deadSinceNano int64) {
 	if g.log == nil {
 		return
 	}
@@ -393,7 +399,7 @@ func (g *DialerGroup) logFixedFallback(state int64, fixed *dialer.Dialer, nt *di
 		retryCount := state - 10
 		old := g.fixedFallbackLastLogMark.Swap(state)
 		if old != state {
-			elapsed := time.Since(time.Unix(0, g.fixedFallbackDeadSince)).Seconds()
+			elapsed := time.Since(time.Unix(0, deadSinceNano)).Seconds()
 			g.log.WithFields(logrus.Fields{
 				"group":   g.Name,
 				"dialer":  nodeName,
@@ -535,7 +541,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				g.fixedFallbackDone = false
 				g.fixedFallbackMu.Unlock()
 				if wasDead {
-					g.logFixedFallback(0, fixed, nt)
+					g.logFixedFallback(0, fixed, nt, 0)
 				}
 				selected := preferAlternateSelectionNetworkType(fixed, nt)
 				return fixed, 0, selected, nil
@@ -570,8 +576,9 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 
 				// Start background retry goroutine if not already running
 				// (may have been started by aliveTransitionCallback already).
+				// Use the live policy so a runtime SetSelectionPolicy change applies.
 				if g.fixedFallbackRunning.CompareAndSwap(false, true) {
-					go g.runFixedFallbackRetry(fixed, policy, nt)
+					go g.runFixedFallbackRetry(fixed, g.currentSelectionState().policy, nt)
 				}
 
 				// Background goroutine handles retries separately.
@@ -591,7 +598,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				if d != nil {
 					g.logFixedFallbackDetail(fixed, d, nt, 0)
 					if logRetry1 {
-						g.logFixedFallback(1, fixed, nt)
+						g.logFixedFallback(1, fixed, nt, 0)
 					}
 					selected := preferAlternateSelectionNetworkType(d, nt)
 					return d, 0, selected, nil
@@ -603,7 +610,7 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 				if d != nil {
 					g.logFixedFallbackDetail(fixed, d, nt, lat)
 					if logRetry1 {
-						g.logFixedFallback(1, fixed, nt)
+						g.logFixedFallback(1, fixed, nt, 0)
 					}
 					selected := preferAlternateSelectionNetworkType(d, nt)
 					return d, lat, selected, nil
@@ -860,13 +867,15 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 	actualTimeout := policy.FixedFallbackTimeout
 	if actualTimeout < 2*time.Second {
 		actualTimeout = 2 * time.Second
-		g.log.WithFields(logrus.Fields{
-			"group":        g.Name,
-			"configured":   policy.FixedFallbackTimeout.String(),
-			"actual":       actualTimeout.String(),
-			"node":         fixed.Property().Name,
-			"network_type": nt.String(),
-		}).Warnln("fixed_fallback timeout too low, clamped to minimum 2s to prevent probe storm")
+		if g.log != nil {
+			g.log.WithFields(logrus.Fields{
+				"group":        g.Name,
+				"configured":   policy.FixedFallbackTimeout.String(),
+				"actual":       actualTimeout.String(),
+				"node":         fixed.Property().Name,
+				"network_type": nt.String(),
+			}).Warnln("fixed_fallback timeout too low, clamped to minimum 2s to prevent probe storm")
+		}
 	}
 	ticker := time.NewTicker(actualTimeout)
 	defer ticker.Stop()
@@ -901,7 +910,10 @@ func (g *DialerGroup) runFixedFallbackRetry(fixed *dialer.Dialer, policy DialerS
 		g.fixedFallbackLastRetryNano = time.Now().UnixNano()
 
 		// Log retry before checking fallback, so user sees N retries for retries=N config.
-		g.logFixedFallback(10+g.fixedFallbackRetryCount, fixed, nt)
+		// g.fixedFallbackDeadSince is read here while fixedFallbackMu is held
+		// (locked region 889-913) and passed in to avoid a lock re-entrancy
+		// inside logFixedFallback.
+		g.logFixedFallback(10+g.fixedFallbackRetryCount, fixed, nt, g.fixedFallbackDeadSince)
 
 		shouldFallback := g.fixedFallbackRetryCount >= int64(policy.FixedFallbackRetries)
 		if shouldFallback {
