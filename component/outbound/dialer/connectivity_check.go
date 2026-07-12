@@ -519,11 +519,14 @@ func shouldSkipIpFamily6(raw []string) bool {
 }
 
 func (d *Dialer) aliveBackground() {
-	// If check_interval is 0 or not configured, skip connectivity check entirely
-	if d.CheckInterval == 0 {
+	// If check_interval is 0, negative, or not configured, skip the
+	// connectivity check entirely. A negative value would otherwise make the
+	// cold-start jitter window and the per-cycle timer negative, panicing
+	// fastrand.Int63n and triggering spurious "probe stuck" timeouts.
+	if d.CheckInterval <= 0 {
 		if d.Log != nil {
 			d.Log.WithField("dialer", d.Property().Name).
-				Warnln("Connectivity check disabled: check_interval not configured. " +
+				Warnln("Connectivity check disabled: check_interval is zero or negative (or unset). " +
 					"Nodes will not be health-checked. " +
 					"Add check_interval, tcp_check_url, and udp_check_dns to enable.")
 		}

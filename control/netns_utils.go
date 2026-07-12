@@ -162,13 +162,14 @@ func (ns *DaeNetns) WithBestEffort(op string, f func() error) {
 	}
 }
 
-// supportsNetkit checks if the kernel supports Netkit devices (requires 6.7+).
+// supportsNetkit reports whether the kernel supports Netkit devices (requires 6.7+).
+// It is a pure predicate: callers log the reason for falling back to veth so
+// the message is not duplicated when this predicate is consulted more than once
+// (e.g. setupVethOrNetkit checks it for both the Netkit attempt and the
+// post-fallback info message).
 // Set DAE_DISABLE_NETKIT=1 env var to force veth fallback (workaround for #1024).
 func (ns *DaeNetns) supportsNetkit() bool {
 	if os.Getenv("DAE_DISABLE_NETKIT") == "1" {
-		if ns.log != nil {
-			ns.log.Warn("Netkit disabled by DAE_DISABLE_NETKIT=1 env var; falling back to veth")
-		}
 		return false
 	}
 	if ns.kernelVersion == nil {
@@ -178,9 +179,17 @@ func (ns *DaeNetns) supportsNetkit() bool {
 }
 
 // setupVethOrNetkit creates a veth or Netkit device pair based on kernel support.
-// It tries Netkit first (kernel 6.7+) and falls back to veth if Netkit fails.
+// It tries Netkit first (kernel 6.7+) and falls back to veth if Netkit fails
+// or is disabled via DAE_DISABLE_NETKIT=1. The "falling back" reason is
+// logged exactly once here (not inside supportsNetkit), so it is not repeated
+// when that predicate is consulted more than once.
 func (ns *DaeNetns) setupVethOrNetkit() (err error) {
-	// Try Netkit first if kernel supports it
+	if ns.kernelVersion == nil {
+		ns.log.Warn("Kernel version unknown; falling back to veth")
+		ns.useNetkit = false
+		return ns.setupVeth()
+	}
+	// Try Netkit first if the kernel supports it.
 	if ns.supportsNetkit() {
 		ns.log.Infof("Kernel %s supports Netkit, attempting to create Netkit device pair",
 			ns.kernelVersion.String())
@@ -190,26 +199,23 @@ func (ns *DaeNetns) setupVethOrNetkit() (err error) {
 			ns.log.Infof("Successfully created Netkit device pair (performance mode)")
 			return nil
 		}
-		// Netkit failed, fall back to veth
+		// Netkit failed, fall back to veth.
 		ns.log.WithFields(logrus.Fields{
 			"error":  err.Error(),
 			"kernel": ns.kernelVersion.String(),
 		}).Warn("Failed to create Netkit device, falling back to veth")
+	} else {
+		ns.log.Warnf("Netkit disabled (DAE_DISABLE_NETKIT=1 set or kernel < %s); falling back to veth",
+			consts.NetkitFeatureVersion)
 	}
 
-	// Fall back to veth
+	// Fall back to veth.
 	ns.log.Info("Falling back to veth device creation")
 	ns.useNetkit = false
 	if err := ns.setupVeth(); err != nil {
 		return fmt.Errorf("failed to create veth device: %w", err)
 	}
-
-	if ns.supportsNetkit() {
-		ns.log.Infof("Created veth device pair (compatibility mode; Netkit was attempted but failed)")
-	} else {
-		ns.log.Infof("Created veth device pair (kernel %s does not support Netkit)",
-			ns.kernelVersion.String())
-	}
+	ns.log.Infof("Created veth device pair (compatibility mode)")
 	return nil
 }
 

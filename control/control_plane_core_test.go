@@ -353,7 +353,7 @@ func TestControlPlaneCore_EjectBpfKeepsHookCleanupForClose(t *testing.T) {
 
 	core := newControlPlaneCore(logger, nil, nil, nil, false)
 	calls := 0
-	core.addManagedBpfHookCleanup(func() error {
+	core.addManagedBpfHookCleanup("test-hook", func() error {
 		calls++
 		return nil
 	})

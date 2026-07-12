@@ -100,9 +100,13 @@ type controlPlaneCore struct {
 	// before other cleanup that might take longer (like dialer shutdown).
 	// Protected by bpfHookMu to avoid deadlock with c.mu in _bindLan/_bindWan.
 	bpfHookDetachFuncs []func() error
-	bpfHookMu          sync.Mutex
-	bpf                atomic.Pointer[bpfObjects]
-	outboundId2Name    map[uint8]string
+	// bpfHookDetachKeys are the dedup keys passed to addManagedBpfHookCleanup,
+	// so self-heal re-binds (which re-call _bindLan/_bindWan on the same
+	// ControlPlaneCore) do not accumulate duplicate detach funcs.
+	bpfHookDetachKeys []string
+	bpfHookMu         sync.Mutex
+	bpf               atomic.Pointer[bpfObjects]
+	outboundId2Name   map[uint8]string
 	// tcpRelayOffload is permanently disabled due to kernel panic issues.
 	// See: https://github.com/daeuniverse/dae/pull/912
 	// Field preserved for ABI compatibility; always remains false.
@@ -152,6 +156,7 @@ func newControlPlaneCore(log *logrus.Logger,
 		log:                log,
 		deferFuncs:         deferFuncs,
 		bpfHookDetachFuncs: make([]func() error, 0),
+		bpfHookDetachKeys:  make([]string, 0),
 		outboundId2Name:    outboundId2Name,
 		kernelVersion:      kernelVersion,
 		flip:               flip,
@@ -220,7 +225,27 @@ func (c *controlPlaneCore) addDeferFunc(deferFunc func() error) bool {
 // immediate detach paths. Hook cleanup must remain active after EjectBpf():
 // ownership transfer only skips bpf.Close(), not removal of this generation's
 // TC filters from the system.
-func (c *controlPlaneCore) addManagedBpfHookCleanup(detachFunc func() error) {
+// addManagedBpfHookCleanup registers hook cleanup for both regular close and
+// immediate detach paths. Hook cleanup must remain active after EjectBpf():
+// ownership transfer only skips bpf.Close(), not removal of this generation's
+// TC filters from the system.
+//
+// key dedupes registrations: self-heal re-binds call _bindLan/_bindWan
+// again on the same ControlPlaneCore, and without dedup each reload that
+// loses a filter would append another (idempotent but ever-growing) detach
+// func to both deferFuncs and bpfHookDetachFuncs. The key identifies
+// the bound (iface, filter) pair.
+func (c *controlPlaneCore) addManagedBpfHookCleanup(key string, detachFunc func() error) {
+	c.bpfHookMu.Lock()
+	for _, k := range c.bpfHookDetachKeys {
+		if k == key {
+			c.bpfHookMu.Unlock()
+			return
+		}
+	}
+	c.bpfHookDetachKeys = append(c.bpfHookDetachKeys, key)
+	c.bpfHookMu.Unlock()
+
 	if !c.addDeferFunc(detachFunc) {
 		if err := detachFunc(); err != nil && c.log != nil {
 			c.log.WithError(err).Warn("controlPlaneCore: failed to detach hook after close began")
@@ -445,10 +470,6 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 	default:
 	}
 	c.log.Infof("Bind to LAN: %v", ifname)
-	c.recordBoundIface(ifname, "LAN",
-		netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)), // ingress
-		netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)), // egress
-	)
 
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
@@ -510,7 +531,7 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		}
 		return nil
 	}
-	c.addManagedBpfHookCleanup(detachFunc)
+	c.addManagedBpfHookCleanup("lan-ingress", detachFunc)
 
 	filterEgress := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
@@ -546,7 +567,14 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		}
 		return nil
 	}
-	c.addManagedBpfHookCleanup(egressDetachFunc)
+	c.addManagedBpfHookCleanup("lan-egress", egressDetachFunc)
+
+	// Record the binding only after both filters are attached, so a
+	// failure mid-bind does not leave a "claimed but absent" entry (M6).
+	c.recordBoundIface(ifname, "LAN",
+		netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)), // ingress
+		netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)), // egress
+	)
 
 	return nil
 }
@@ -603,8 +631,8 @@ func (c *controlPlaneCore) setupSkPidMonitor() error {
 		}
 		detachFuncs = append(detachFuncs, detachFunc)
 	}
-	for _, detachFunc := range detachFuncs {
-		c.addManagedBpfHookCleanup(detachFunc)
+	for i, detachFunc := range detachFuncs {
+		c.addManagedBpfHookCleanup(fmt.Sprintf("inet6bind-%d", i), detachFunc)
 	}
 	return nil
 }
@@ -665,10 +693,6 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 	default:
 	}
 	c.log.Infof("Bind to WAN: %v", ifname)
-	c.recordBoundIface(ifname, "WAN",
-		netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)), // egress
-		netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)), // ingress
-	)
 
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
@@ -727,7 +751,7 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		}
 		return nil
 	}
-	c.addManagedBpfHookCleanup(egressDetachFunc)
+	c.addManagedBpfHookCleanup("wan-egress", egressDetachFunc)
 
 	filterIngress := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
@@ -761,7 +785,13 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		}
 		return nil
 	}
-	c.addManagedBpfHookCleanup(ingressDetachFunc)
+	c.addManagedBpfHookCleanup("wan-ingress", ingressDetachFunc)
+
+	// Record the binding only after both filters are attached (M6).
+	c.recordBoundIface(ifname, "WAN",
+		netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)), // egress
+		netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)), // ingress
+	)
 
 	return nil
 }
@@ -828,7 +858,7 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 			return nil
 		})
 	}
-	c.addManagedBpfHookCleanup(detachFunc)
+	c.addManagedBpfHookCleanup("dae0peer-ingress", detachFunc)
 	// Record the dae0peer binding (in the dae netns) so validateDatapathBindings
 	// can confirm its TC filter survived a reload. It is checked inside the dae
 	// netns; a missing dae0peer filter is a warning (non-fatal), mirroring dae0's
@@ -866,7 +896,7 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 		}
 		return nil
 	}
-	c.addManagedBpfHookCleanup(dae0DetachFunc)
+	c.addManagedBpfHookCleanup("dae0-ingress", dae0DetachFunc)
 	return
 }
 
@@ -966,9 +996,15 @@ func (c *controlPlaneCore) checkBindingInNetns(bi boundIface) (ok bool, reason s
 // all other interfaces are resolved in the host netns.
 func (c *controlPlaneCore) checkBinding(bi boundIface) (ok bool, reason string) {
 	if bi.label == "dae0peer" {
+		ns := GetDaeNetns()
+		if ns == nil {
+			// Defensive: the dae netns must exist by the time bindings are
+			// validated, but a nil receiver here would panic the whole check.
+			return false, fmt.Sprintf("%s (%s): dae netns not yet initialised", bi.name, bi.label)
+		}
 		var innerOk bool
 		var innerReason string
-		if err := GetDaeNetns().WithRequired("check dae0peer binding", func() error {
+		if err := ns.WithRequired("check dae0peer binding", func() error {
 			innerOk, innerReason = c.checkBindingInNetns(bi)
 			return nil
 		}); err != nil {
@@ -1001,6 +1037,10 @@ func (c *controlPlaneCore) missingBindings() (missing []boundIface, fatal bool) 
 	return missing, fatal
 }
 
+// validateDatapathBindings is a diagnostic entry point used by unit tests to
+// assert that all recorded TC filters are attached. In production the bind
+// path uses missingBindings()/repairDatapathBindings() instead; this helper
+// is intentionally not part of the live startup/reload flow (see L6 review note).
 func (c *controlPlaneCore) validateDatapathBindings() (missing []string, fatal bool) {
 	bad, fatal := c.missingBindings()
 	for _, bi := range bad {

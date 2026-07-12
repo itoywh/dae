@@ -53,6 +53,10 @@ type DialerGroup struct {
 	// Started when the fixed node is first detected dead.
 	// Stopped when the node recovers (MustGetAlive=true).
 	fixedFallbackRunning atomic.Bool
+	// fixedFallbackCbRegistered guards the alive-transition callback so it is
+	// registered at most once (also when SetSelectionPolicy switches into
+	// FixedWithFallback at runtime, not just at group creation).
+	fixedFallbackCbRegistered bool
 
 	// fixed_fallback log rate limit
 	fixedFallbackLastLogMark atomic.Int64
@@ -184,6 +188,33 @@ func (g *DialerGroup) SetSelectionPolicy(policy DialerSelectionPolicy) {
 		g.registerAliveDialerSets(next.aliveDialerSets)
 		for _, d := range g.Dialers {
 			d.ActivateCheck()
+		}
+		// When switching into FixedWithFallback at runtime (not just at group
+		// creation), wire the alive-transition callback so a node death without
+		// traffic still triggers the background probe goroutine. Guard with
+		// fixedFallbackCbRegistered so repeated switches do not stack callbacks.
+		if !g.fixedFallbackCbRegistered &&
+			policy.Policy == consts.DialerSelectionPolicy_FixedWithFallback &&
+			policy.FixedIndex >= 0 && policy.FixedIndex < len(g.Dialers) {
+			fixed := g.Dialers[policy.FixedIndex]
+			if fixed != nil {
+				fixed.RegisterAliveTransitionCallback(func(nt *dialer.NetworkType, alive bool) {
+					if alive {
+						return
+					}
+					if g.fixedFallbackRunning.CompareAndSwap(false, true) {
+						g.fixedFallbackMu.Lock()
+						g.fixedFallbackDeadSince = time.Now().UnixNano()
+						g.fixedFallbackRetryCount = 0
+						g.fixedFallbackMu.Unlock()
+						// Read the live policy at spawn time so a runtime
+						// SetSelectionPolicy change is picked up, instead of
+						// the p captured by this closure (stale after reload).
+						go g.runFixedFallbackRetry(fixed, g.currentSelectionState().policy, nt)
+					}
+				})
+				g.fixedFallbackCbRegistered = true
+			}
 		}
 		g.selectionState.Store(next)
 

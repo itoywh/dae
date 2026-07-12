@@ -1,20 +1,25 @@
 #!/bin/sh
 # luci-app-dae 日志页增强安装脚本
-# 仅注入「清除日志」按钮（最小化 patch，不改动上游其他代码）
-# 版本: v1.1.0
+# 仅注入「清除日志」按钮 + ACL 写权限（最小化 patch，不改动上游其他代码）
+# 版本: v1.2.0
 # 固定托管(Gist): https://gist.github.com/itoywh/3778f690647ea1636e892b003a630eae
 # 用法: curl -sL https://gist.githubusercontent.com/itoywh/3778f690647ea1636e892b003a630eae/raw/install-luci-logpatch.sh | sh
 #
-# 原理：
-#   1. log.js — 用 sed 在 scrollDownButton 后注入 clearLogButton 定义，
-#      并在 DOM 返回中把 [scrollDownButton] 改为 [scrollDownButton, clearLogButton]
-#   2. ACL  — 仅追加 /var/log/dae/dae.log 的写权限条目，不覆盖整个文件
-#   上游更新 log.js 时只要 scrollDownButton 结构不变即可正确注入
+# 设计要点（针对 ImmortalWrt/OpenWrt 的 busybox sed/ash 稳健性）：
+#   - A) log.js 注入：内容先写入临时文件，再用 sed 的 r 命令插入到
+#     scrollDownButton 监听器闭合 }); 之后。r 是 POSIX 命令，在
+#     busybox / BSD / GNU sed 上行为一致，彻底规避多行 a\ 的转义差异。
+#   - B) ACL 注入：用标准 /regex/ 地址（不依赖 \| 扩展），
+#     先给匹配行补尾逗号、再单行 a\ 追加 dae.log 写权限条目。
+#   - A/B 各自独立幂等判定，互不干扰（避免一处已装、另一处漏装时重跑被跳过）。
+#   - 备份仅首次保留原始文件，重跑不覆盖（保留可回滚的原版）。
 
 set -e
 
 LOG_JS="/www/luci-static/resources/view/dae/log.js"
 ACL_JSON="/usr/share/rpcd/acl.d/luci-app-dae.json"
+LOG_BAK="/tmp/log.js.bak"
+ACL_BAK="/tmp/luci-app-dae-acl.bak"
 
 # ── 前置检查 ──────────────────────────────────────────────
 if [ ! -f "$LOG_JS" ]; then
@@ -23,83 +28,82 @@ if [ ! -f "$LOG_JS" ]; then
     exit 1
 fi
 
-# ── 备份 ────────────────────────────────────────────────────
-cp "$LOG_JS" /tmp/log.js.bak
-echo "已备份原始文件到 /tmp/log.js.bak"
-[ -f "$ACL_JSON" ] && cp "$ACL_JSON" /tmp/luci-app-dae-acl.bak && echo "已备份 ACL 到 /tmp/luci-app-dae-acl.bak"
+# ── 备份（仅首次，保留可回滚的原始版本）───────────────
+if [ ! -f "$LOG_BAK" ]; then
+    cp "$LOG_JS" "$LOG_BAK"
+    echo "已备份原始 log.js 到 $LOG_BAK"
+fi
+if [ -f "$ACL_JSON" ] && [ ! -f "$ACL_BAK" ]; then
+    cp "$ACL_JSON" "$ACL_BAK"
+    echo "已备份原始 ACL 到 $ACL_BAK"
+fi
 
 # ── 1) 注入 log.js：添加清除日志按钮 ──────────────────────
-# 检查是否已经打过补丁（防止重复运行）
+# 独立幂等判定：已含 clearLogButton 则跳过（不依赖 ACL 状态）。
 if grep -q 'clearLogButton' "$LOG_JS"; then
     echo "⚠️  log.js 已包含 clearLogButton，跳过注入"
 else
-    # 注入点 A：在 scrollDownButton 的 addEventListener 闭合后，
-    #           插入 clearLogButton 定义 + 事件监听
-    #
-    # 匹配目标（上游原始）：
-    #   scrollDownButton.addEventListener('click', () => {
-    #       scrollUpButton.scrollIntoView();
-    #       scrollDownButton.blur();
-    #   });
-    sed -i '/scrollDownButton\.addEventListener.*click/,/^        });$/{
-        /^        });$/a\
-\
-\tconst clearLogButton = E('\''button'\'', {\
-\t\t'\''id'\'': '\''clearLogButton'\'',\
-\t\t'\''class'\'': '\''cbi-button cbi-button-negative'\'',\
-\t\t'\''style'\'': '\''margin-left:8px'\'',\
-\t}, '\''清除日志'\'');\
-clearLogButton.addEventListener('\''click'\'', function() {\
-\tfs.write('\''/var/log/dae/dae.log'\'', '\'''\'').then(logRefresh).catch(function(e) {\
-\t\tconsole.error('\''Failed to clear log:'\'', e);\
-\t});\
+    # 内容写入临时文件（避免 sed a\ 多行转义在 busybox 上的差异）。
+    cat > /tmp/dae_clearbtn.js <<'JSEOF'
+const clearLogButton = E('button', {
+    'id': 'clearLogButton',
+    'class': 'cbi-button cbi-button-negative',
+    'style': 'margin-left:8px'
+}, '清除日志');
+clearLogButton.addEventListener('click', function() {
+    fs.write('/var/log/dae/dae.log', '').then(logRefresh).catch(function(e) {
+        console.error('Failed to clear log:', e);
+    });
 });
+JSEOF
+    # 锚点：scrollDownButton 的 click 监听器闭合 }); 之后插入。
+    # 结束锚用 /});/（兼容上游 4/8 空格缩进）。
+    sed -i -e '/scrollDownButton\.addEventListener.*click/,/});/{
+        /});/r /tmp/dae_clearbtn.js
     }' "$LOG_JS"
+    rm -f /tmp/dae_clearbtn.js
 
-    # 注入点 B：把 [scrollDownButton]) 改为 [scrollDownButton, clearLogButton])
-    #            （让清除按钮出现在滚动到底部按钮旁边）
-    sed -i 's/\[scrollDownButton]\)/[scrollDownButton, clearLogButton])/' "$LOG_JS"
-
-    echo "✅ log.js：已注入清除日志按钮"
-fi
-
-# ── 2) 补充 ACL 写权限 ─────────────────────────────────────
-if [ ! -f "$ACL_JSON" ]; then
-    echo "⚠️  ACL 文件不存在 ($ACL_JSON)，跳过权限更新（可能需要手动配置）"
-else
-    # 检查是否已有日志写权限
-    if grep -q '"/var/log/dae/dae.log".*write' "$ACL_JSON"; then
-        echo "⚠️  ACL 已包含 dae.log 写权限，跳过"
+    # 校验注入是否真正成功（避免静默失败）
+    if grep -q 'clearLogButton' "$LOG_JS"; then
+        echo "✅ log.js：已注入清除日志按钮"
     else
-        # 在 write.file 段的最后一个条目后追加日志写权限
-        # 匹配 "/etc/dae/config.dae": [ "write" ] 这行：
-        #   ① 给匹配行补尾逗号（JSON 对象条目间需逗号分隔）
-        #   ② 在其后插入 dae.log 写权限条目
-        # 注意：sed 地址范围 '{...}' 内 s/a/a\ 命令顺序执行
-        sed -i '\|"/etc/dae/config.dae".*"write"|{
-            # 确保该行以逗号结尾（幂等：已有逗号则不重复追加）
-            /,$/!s/$/,/
-            # 在该行后插入新条目
-            a\
-\t\t\t\t"/var/log/dae/dae.log": [ "write" ]
-        }' "$ACL_JSON"
-
-        # 校验 JSON 合法性；失败则回滚备份并报错
-        if command -v jsonfilter >/dev/null 2>&1; then
-            if ! jsonfilter -i "$ACL_JSON" >/dev/null 2>&1; then
-                echo "❌ 错误: $ACL_JSON 注入后 JSON 非法，正在回滚..."
-                cp /tmp/luci-app-dae-acl.bak "$ACL_JSON"
-                echo "已从备份恢复原始文件。请检查上游 ACL 格式是否发生变化"
-                exit 1
-            fi
-        fi
-
-        /etc/init.d/rpcd reload 2>/dev/null || true
-        echo "✅ ACL：已添加 dae.log 写权限并重载 rpcd"
+        echo "❌ log.js 注入失败（上游 log.js 结构可能已变化），正在回滚..."
+        cp "$LOG_BAK" "$LOG_JS"
+        exit 1
     fi
 fi
 
-# ── 完成 ────────────────────────────────────────────────────
+# ── 2) 补充 ACL 写权限 ───────────────────────────────────
+# 独立幂等判定：已含 dae.log 写权限则跳过（不依赖 log.js 状态）。
+if [ ! -f "$ACL_JSON" ]; then
+    echo "⚠️  ACL 文件不存在 ($ACL_JSON)，跳过权限更新（可能需要手动配置）"
+elif grep -q '"/var/log/dae/dae.log".*write' "$ACL_JSON"; then
+    echo "⚠️  ACL 已包含 dae.log 写权限，跳过"
+else
+    # 在 write.file 段的 config.dae 条目后追加日志写权限：
+    #   ① 给匹配行补尾逗号（JSON 对象条目间需逗号分隔）
+    #   ② 在其后插入 dae.log 写权限条目
+    sed -i -e '/"\/etc\/dae\/config.dae".*"write"/{
+        s/$/,/
+        a\
+    "/var/log/dae/dae.log": [ "write" ]
+    }' "$ACL_JSON"
+
+    # 校验 JSON 合法性；失败则回滚备份并报错
+    if command -v jsonfilter >/dev/null 2>&1; then
+        if ! jsonfilter -i "$ACL_JSON" >/dev/null 2>&1; then
+            echo "❌ 错误: $ACL_JSON 注入后 JSON 非法，正在回滚..."
+            cp "$ACL_BAK" "$ACL_JSON"
+            echo "已从备份恢复原始文件。请检查上游 ACL 格式是否发生变化"
+            exit 1
+        fi
+    fi
+
+    /etc/init.d/rpcd reload 2>/dev/null || true
+    echo "✅ ACL：已添加 dae.log 写权限并重载 rpcd"
+fi
+
+# ── 完成 ───────────────────────────────────────────────────
 echo ""
 echo "✅ 安装完成！"
 echo "   - 日志页面已添加「清除日志」按钮（红色，位于 Scroll to tail 旁）"
