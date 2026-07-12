@@ -787,11 +787,13 @@ func (d *Dialer) aliveBackground() {
 			wg.Wait()
 			close(waitDone)
 		}()
+		stuckTimer := time.NewTimer(cycle + 5*time.Second)
 		select {
 		case <-waitDone:
 		case <-d.ctx.Done():
+			stuckTimer.Stop()
 			return
-		case <-time.After(cycle + 5*time.Second):
+		case <-stuckTimer.C:
 			// Probe(s) appear stuck — log diagnostic and continue.
 			// The stuck probe will eventually resolve, but we don't block
 			// the entire check cycle waiting for it.
@@ -800,6 +802,7 @@ func (d *Dialer) aliveBackground() {
 					Warnln("Health check probe appears stuck; continuing cycle")
 			}
 		}
+		stuckTimer.Stop()
 		if checkFamily == "" {
 			// Stability-based wash white: only reset stability if a protocol family had failures
 			// WITHOUT any successes in this cycle. This allows partially-working dual-stack
