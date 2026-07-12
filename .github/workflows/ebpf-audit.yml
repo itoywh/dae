@@ -64,3 +64,60 @@ jobs:
         with:
           name: ebpf-audit
           path: build/ebpf-audit
+
+  # Temporary: build linux-amd64 binary (remove after CI is fixed)
+  build_linux_amd64:
+    name: Build dae (linux-amd64)
+    runs-on: ubuntu-22.04
+    needs: ebpf_audit
+    if: github.event_name == 'workflow_dispatch'
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: 0
+
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+        with:
+          ref: v2.0-custom
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang-15 llvm-15
+
+      - name: Get project dependencies
+        run: |
+          git submodule update --init --recursive
+          GOMODCACHE="${PWD}"/go-mod go mod download -modcacherw
+          find ./go-mod/ -maxdepth 1 ! -name "cache" ! -name "go-mod" -exec rm -rf {} \;
+          sed -i 's/#export GOMODCACHE=$(PWD)\/go-mod/export GOMODCACHE=$(PWD)\/go-mod/' Makefile
+
+      - name: Build dae (linux-amd64)
+        run: |
+          mkdir -p ./build/
+          export GOFLAGS="-trimpath -modcacherw"
+          export GOEXPERIMENT="newinliner,simd,heapminimum512kib,randomizedheapbase64"
+          export OUTPUT=build/dae-linux-amd64
+          export VERSION=v2.0.0-custom
+          export CLANG=clang-15
+          export STRIP=llvm-strip-15
+          make dae
+          echo "=== Build result ==="
+          ls -la build/dae-linux-amd64
+          ./build/dae-linux-amd64 --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dae-linux-amd64
+          path: build/dae-linux-amd64
+          retention-days: 7
