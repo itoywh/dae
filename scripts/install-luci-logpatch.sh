@@ -1,6 +1,6 @@
 #!/bin/sh
 # ============================================================================
-# luci-app-dae LuCI 增强一键脚本（直连版 v2.2.1）
+# luci-app-dae LuCI 增强一键脚本（直连版 v2.2.2）
 # 适用: ImmortalWrt/OpenWrt (busybox ash) + luci-app-dae
 #
 # 本脚本合并两个增强功能：
@@ -14,12 +14,9 @@
 #       机制: 上游 /etc/init.d/dae 写死 --disable-timestamp，优先级高于 dae #1021
 #             运行时智能抑制（#1021 逻辑：配了 --logfile -> 不走 journald ->
 #             保留 CST 时间戳）；该静态 flag 强制关时间戳，导致日志无时间戳。
-#       修复: sed 去除该 flag 后 /etc/init.d/dae restart，dae 走 #1021 分支，
+#       修复: sed 仅删除 --disable-timestamp 这个词（不删整行），随后
+#             /etc/init.d/dae restart，dae 走 #1021 分支，
 #             日志显示 CST 时间戳（如 [2026-07-15 17:22:30]）。重启/重装均持久。
-#       机制: 点击 -> fs.write('/var/log/dae/dae.log','') 清空 -> dom.content 立即
-#              显示「Log is empty.」，复用原生 poll 轮询刷新。
-#       注: 整文件重写（非 sed 锚点），因原装 log.js 已压缩成单行，sed 会把按钮插成
-#           死代码；且原装无 logRefresh 函数。
 #
 # 统一 ACL: 两功能所需 rpcd 权限（config.dae/dae.log 读写、hot_reload/restart exec）。
 #          不再需要 sentinel 写路径（v2.0.x 的 watchdog 方案已废弃）。
@@ -33,7 +30,7 @@
 # ============================================================================
 set -u
 TS=$(date +%Y%m%d%H%M%S)
-echo "=== luci-app-dae 增强注入（直连版 v2.2.1, 备份后缀 .bak.$TS）==="
+echo "=== luci-app-dae 增强注入（直连版 v2.2.2, 备份后缀 .bak.$TS）==="
 
 CFG=/www/luci-static/resources/view/dae/config.js
 LOGJS=/www/luci-static/resources/view/dae/log.js
@@ -247,8 +244,11 @@ fi
 # 日志显示 CST 时间戳（如 [2026-07-15 17:22:30]）。重启/重装均持久。
 if [ -f "$INITDAE" ]; then
     if grep -q 'disable-timestamp' "$INITDAE"; then
-        cp -a "$INITDAE" "$INITDAE.bak.$TS" && echo "backup: $INITDAE -> $INITDAE.bak.$TS"
-        sed -i '/disable-timestamp/d' "$INITDAE"
+        # 只删除 --disable-timestamp 这个词，绝不删整行：
+        # 某些 init 版本可能把该 flag 与其它参数写在同一行（如
+        # `procd_append_param command --logfile "$X" --disable-timestamp`），删整行
+        # 会误删同行参数导致日志功能受损。该文件已在 step 0 做时间戳备份。
+        sed -i 's/[[:space:]]*--disable-timestamp//g' "$INITDAE"
         echo "✅ 已去除 $INITDAE 的 --disable-timestamp（时间戳将在 dae 重启后恢复）"
         # cmdline 参数变更必须 restart 而非 reload
         /etc/init.d/dae restart 2>/dev/null
