@@ -234,8 +234,8 @@ DAE_LOGJS_EOF
     fi
 fi
 
-# ── 4. 重启 rpcd（加载新 ACL）─────────────────────────────────────
-/etc/init.d/rpcd restart 2>/dev/null
+# ── 4. 重载 rpcd（加载新 ACL，不杀进程、保留登录态）────────────────
+/etc/init.d/rpcd reload 2>/dev/null
 
 # ── 4.5 时间戳修复: 去除 init 脚本硬编码 --disable-timestamp ──────
 # 上游 /etc/init.d/dae 写死 --disable-timestamp，优先级高于 dae #1021 运行时
@@ -279,4 +279,4 @@ echo "=== 完成 ==="
 echo "浏览器硬刷新 (Cmd+Shift+R) 后："
 echo "  - dae 配置页应看到「保存并重启」按钮（点击直接重启，无常驻进程）"
 echo "  - dae 日志页应看到「清除日志」按钮（红色）"
-echo "如需回滚: 把上面 .bak.$TS 文件复制回原名，再 /etc/init.d/rpcd restart"
+echo "如需回滚: 把上面 .bak.$TS 文件复制回原名，再 /etc/init.d/rpcd reload"
